@@ -1,0 +1,163 @@
+const User   = require('../models/User');
+const { Like, Match } = require('../models/Match');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/users/search
+// Search/discover users with filters
+// ─────────────────────────────────────────────────────────────────────────────
+exports.searchUsers = async (req, res) => {
+  try {
+    const {
+      gender, city, country, profession,
+      minAge, maxAge,
+      page  = 1,
+      limit = 10,
+    } = req.query;
+
+    console.log('🔍 [Search] Params:', req.query);
+
+    // Get IDs the current user has already liked or passed
+    const alreadyLiked = await Like.find({ sender: req.user._id }).distinct('receiver');
+
+    // Build filter
+    const filter = {
+      _id:             { $ne: req.user._id, $nin: alreadyLiked },
+      isActive:        true,
+      isBanned:        false,
+      isProfileHidden: false,
+    };
+
+    if (gender)     filter.gender  = gender;
+    if (city)       filter.city    = new RegExp(city,    'i');
+    if (country)    filter.country = new RegExp(country, 'i');
+    if (profession) filter.profession = new RegExp(profession, 'i');
+
+    // Age filter
+    if (minAge || maxAge) {
+      filter.dateOfBirth = {};
+      if (maxAge) filter.dateOfBirth.$gte = new Date(Date.now() - maxAge * 365.25 * 86400000);
+      if (minAge) filter.dateOfBirth.$lte = new Date(Date.now() - minAge * 365.25 * 86400000);
+    }
+
+    const skip  = (Number(page) - 1) * Number(limit);
+    const total = await User.countDocuments(filter);
+    const users = await User.find(filter)
+      .select('name dateOfBirth city country profession interests bio religion education profilePicture photos isOnline lookingFor verificationBadge isVerified')
+      .skip(skip)
+      .limit(Number(limit))
+      .lean();
+
+    console.log(`✅ [Search] Found ${users.length} users (page ${page})`);
+
+    res.status(200).json({
+      success: true,
+      users,
+      total,
+      page:       Number(page),
+      totalPages: Math.ceil(total / Number(limit)),
+      hasMore:    skip + users.length < total,
+    });
+  } catch (error) {
+    console.error('❌ [Search] Error:', error.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/users/:id
+// Get a single user profile by ID
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getUserById = async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id)
+      .select('-password -otp -otpExpires -resetPasswordToken -resetPasswordExpires');
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+    if (user.isProfileHidden || user.isBanned) {
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+
+    res.status(200).json({ success: true, user });
+  } catch (error) {
+    console.error('❌ [GetUser] Error:', error.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUT /api/users/profile
+// Update own profile
+// ─────────────────────────────────────────────────────────────────────────────
+exports.updateProfile = async (req, res) => {
+  try {
+    const allowed = [
+      'name', 'bio', 'profession', 'religion', 'interests',
+      'city', 'country', 'isProfileHidden', 'lookingFor',
+      'education', 'drink', 'smoke', 'height',
+    ];
+    const updates = Object.fromEntries(
+      Object.entries(req.body).filter(([k]) => allowed.includes(k))
+    );
+
+    const user = await User.findByIdAndUpdate(req.user._id, updates, {
+      new: true, runValidators: true,
+    }).select('-password -otp -otpExpires');
+
+    res.status(200).json({ success: true, user });
+  } catch (error) {
+    console.error('❌ [UpdateProfile] Error:', error.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/users/:id/block
+// Block a user
+// ─────────────────────────────────────────────────────────────────────────────
+exports.blockUser = async (req, res) => {
+  try {
+    const targetId = req.params.id;
+    if (targetId === req.user._id.toString()) {
+      return res.status(400).json({ success: false, message: 'Cannot block yourself.' });
+    }
+
+    // Remove any existing match between them
+    await Match.deleteOne({ users: { $all: [req.user._id, targetId] } });
+
+    // Remove likes between them
+    await Like.deleteMany({
+      $or: [
+        { sender: req.user._id, receiver: targetId },
+        { sender: targetId,     receiver: req.user._id },
+      ],
+    });
+
+    res.status(200).json({ success: true, message: 'User blocked successfully.' });
+  } catch (error) {
+    console.error('❌ [BlockUser] Error:', error.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/users/:id/report
+// Report a user
+// ─────────────────────────────────────────────────────────────────────────────
+exports.reportUser = async (req, res) => {
+  try {
+    const { reason, description } = req.body;
+    if (!reason) {
+      return res.status(400).json({ success: false, message: 'Reason is required.' });
+    }
+
+    // In a full implementation, save to a Report model
+    console.log(`🚨 [Report] User ${req.user._id} reported ${req.params.id}: ${reason}`);
+
+    res.status(200).json({ success: true, message: 'Report submitted. Our team will review it.' });
+  } catch (error) {
+    console.error('❌ [ReportUser] Error:', error.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
