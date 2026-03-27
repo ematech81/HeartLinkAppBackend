@@ -1,4 +1,64 @@
-node_modules/
+# ─── Environment Variables ────────────────────────────────────────────────────
 .env
-.env.*
-npm-debug.log
+.env.local
+.env.development
+.env.production
+
+# ─── Node Modules ────────────────────────────────────────────────────────────
+node_modules/
+
+# ─── Expo ────────────────────────────────────────────────────────────────────
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# ─── React Native ────────────────────────────────────────────────────────────
+# Android
+android/
+*.apk
+*.aab
+
+# iOS
+ios/
+*.ipa
+*.xcarchive
+Pods/
+
+# ─── Build Outputs ────────────────────────────────────────────────────────────
+build/
+.next/
+out/
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ─── OS Files ─────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+Thumbs.db
+desktop.ini
+
+# ─── Editor / IDE ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── Testing ──────────────────────────────────────────────────────────────────
+coverage/
+.nyc_output/
+
+# ─── Package Manager ──────────────────────────────────────────────────────────
+yarn.lock       # keep if using yarn, delete this line
+package-lock.json  # keep if using npm, delete this line
+
+# ─── Misc ─────────────────────────────────────────────────────────────────────
+*.pem
+.cache/
+tmp/
+temp/
