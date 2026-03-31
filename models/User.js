@@ -43,6 +43,11 @@ const userSchema = new mongoose.Schema(
       enum: ['high_school', 'diploma', 'bachelors', 'masters', 'phd', 'vocational', 'none'],
     },
 
+    location: {
+      type:        { type: String, enum: ['Point'], default: 'Point' },
+      coordinates: { type: [Number], default: [0, 0] }, // [longitude, latitude]
+    },
+
     // ── Step 5: Kids (single parents) ─────────────────────────────────────
     numberOfKids: { type: Number, min: 0 },
     kidsAges:     [{ type: String }],
@@ -87,6 +92,9 @@ const userSchema = new mongoose.Schema(
     resetPasswordToken:   { type: String, select: false },
     resetPasswordExpires: { type: Date,   select: false },
 
+    // ── Push notifications ─────────────────────────────────────────────────
+    pushToken: { type: String, default: null },
+
     // ── Account status ─────────────────────────────────────────────────────
     isActive:        { type: Boolean, default: true },
     isBanned:        { type: Boolean, default: false },
@@ -96,6 +104,8 @@ const userSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+
 
 // ── Virtual: age ──────────────────────────────────────────────────────────────
 userSchema.virtual('age').get(function () {
@@ -113,13 +123,6 @@ userSchema.pre('save', async function () {
 
 
 
-// userSchema.pre('save', async function (next) {
-//   if (!this.isModified('password')) return next();
-//   const salt = await bcrypt.genSalt(12);
-//   this.password = await bcrypt.hash(this.password, salt);
-//   next();
-// });
-
 userSchema.methods.comparePassword = async function (candidate) {
   return bcrypt.compare(candidate, this.password);
 };
@@ -127,5 +130,11 @@ userSchema.methods.comparePassword = async function (candidate) {
 userSchema.methods.isOtpValid = function (otp) {
   return this.otp === otp && this.otpExpires > Date.now();
 };
+
+
+
+// ── Indexes ───────────────────────────────────────────────────────────────────
+userSchema.index({ location: '2dsphere' }); 
+
 
 module.exports = mongoose.model('User', userSchema);

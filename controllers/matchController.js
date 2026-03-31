@@ -1,5 +1,6 @@
 const { Like, Match } = require('../models/Match');
 const User = require('../models/User');
+const { sendPushNotification } = require('../utils/pushNotification');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/matches/like/:userId
@@ -45,6 +46,28 @@ exports.likeUser = async (req, res) => {
         match = await Match.create({ users: [senderId, receiverId] });
         match = await match.populate('users', 'name profilePicture photos city country profession');
         console.log(`🎉 [Match] New match: ${senderId} ↔ ${receiverId}`);
+
+        // ── Notify both users of the new match ────────────────────────────
+        const [userA, userB] = await Promise.all([
+          User.findById(senderId).select('name pushToken'),
+          User.findById(receiverId).select('name pushToken'),
+        ]);
+        if (userB?.pushToken) {
+          sendPushNotification(
+            userB.pushToken,
+            "It's a Match! 💕",
+            `You and ${userA.name.split(' ')[0]} have liked each other. Say hello!`,
+            { type: 'match', matchId: match._id.toString() }
+          );
+        }
+        if (userA?.pushToken) {
+          sendPushNotification(
+            userA.pushToken,
+            "It's a Match! 💕",
+            `You and ${userB.name.split(' ')[0]} have liked each other. Say hello!`,
+            { type: 'match', matchId: match._id.toString() }
+          );
+        }
       } else {
         match = existing;
       }
@@ -106,16 +129,14 @@ exports.getMatches = async (req, res) => {
       .lean();
 
     // Format: return the OTHER user's info alongside match id
-    const formatted = matches.map((match) => {
-      const otherUser = match.users.find(
-        (u) => u._id.toString() !== req.user._id.toString()
-      );
-      return {
-        matchId:   match._id,
-        matchedAt: match.matchedAt,
-        user:      otherUser,
-      };
-    });
+    const formatted = matches
+  .map((match) => {
+    const otherUser = match.users.find(
+      (u) => u._id?.toString() !== req.user._id.toString()
+    );
+    return { matchId: match._id, matchedAt: match.matchedAt, user: otherUser };
+  })
+  .filter((m) => m.user != null); // ← remove matches with no user
 
     console.log(`✅ [GetMatches] Found ${formatted.length} matches for ${req.user._id}`);
     res.status(200).json({ success: true, matches: formatted });

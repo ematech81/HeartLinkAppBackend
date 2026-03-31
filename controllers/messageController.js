@@ -1,6 +1,7 @@
 const Message = require('../models/Message');
 const { Match } = require('../models/Match');
 const User = require('../models/User');
+const { sendPushNotification } = require('../utils/pushNotification');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/messages/conversations
@@ -189,6 +190,18 @@ exports.sendMessage = async (req, res) => {
     });
 
     console.log(`✅ [SendMessage] ${senderId} → ${receiverId}: "${content.substring(0, 30)}..."`);
+
+    // ── Push notification to receiver if they have a token ────────────────
+    if (receiver.pushToken) {
+      const sender = await User.findById(senderId).select('name');
+      const preview = content.length > 60 ? content.substring(0, 60) + '…' : content;
+      sendPushNotification(
+        receiver.pushToken,
+        sender.name.split(' ')[0],
+        preview,
+        { type: 'message', senderId: senderId.toString() }
+      );
+    }
 
     res.status(201).json({ success: true, message });
 

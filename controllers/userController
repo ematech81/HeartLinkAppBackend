@@ -2,6 +2,29 @@ const User   = require('../models/User');
 const { Like, Match } = require('../models/Match');
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PUT /api/users/push-token
+// Save or update the user's Expo push token
+// ─────────────────────────────────────────────────────────────────────────────
+exports.savePushToken = async (req, res) => {
+  try {
+    const { pushToken } = req.body;
+    if (!pushToken) {
+      return res.status(400).json({ success: false, message: 'Push token is required.' });
+    }
+    await User.findByIdAndUpdate(req.user._id, { pushToken });
+    console.log(`📲 [PushToken] Saved for ${req.user._id}`);
+    res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('❌ [PushToken] Error:', error.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+
+
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /api/users/search
 // Search/discover users with filters
 // ─────────────────────────────────────────────────────────────────────────────
@@ -10,58 +33,132 @@ exports.searchUsers = async (req, res) => {
     const {
       gender, city, country, profession,
       minAge, maxAge,
-      page  = 1,
-      limit = 10,
+      page   = 1,
+      limit  = 20,
+      tab,           // 'nearby' | 'global'
+      lat,           // GPS latitude
+      lng,           // GPS longitude
+      radius = 50,   // km radius (default 50km)
     } = req.query;
-
+ 
     console.log('🔍 [Search] Params:', req.query);
-
-    // Get IDs the current user has already liked or passed
+ 
     const alreadyLiked = await Like.find({ sender: req.user._id }).distinct('receiver');
-
-    // Build filter
+ 
+    // ── Base filter ───────────────────────────────────────────────────────────
     const filter = {
       _id:             { $ne: req.user._id, $nin: alreadyLiked },
       isActive:        true,
       isBanned:        false,
       isProfileHidden: false,
     };
-
-    if (gender)     filter.gender  = gender;
-    if (city)       filter.city    = new RegExp(city,    'i');
-    if (country)    filter.country = new RegExp(country, 'i');
-    if (profession) filter.profession = new RegExp(profession, 'i');
-
-    // Age filter
+ 
+    // ── Tab filter ────────────────────────────────────────────────────────────
+    if (tab === 'global') {
+      // Global: users from different countries
+      if (req.user.country) {
+        filter.country = { $not: new RegExp(`^${req.user.country}$`, 'i') };
+      }
+    } else if (tab === 'nearby' && !lat) {
+      // Nearby without GPS: same country fallback
+      if (req.user.country) {
+        filter.country = new RegExp(req.user.country, 'i');
+      }
+    }
+ 
+    // ── Standard filters ──────────────────────────────────────────────────────
+    if (gender)                     filter.gender           = gender;
+    if (city)                       filter.city             = new RegExp(city, 'i');
+    if (country)                    filter.country          = new RegExp(country, 'i');
+    if (profession)                 filter.profession       = new RegExp(profession, 'i');
+    if (req.query.relationshipType) filter.relationshipType = req.query.relationshipType;
+    if (req.query.religion)         filter.religion         = new RegExp(req.query.religion, 'i');
+    if (req.query.education)        filter.education        = new RegExp(req.query.education, 'i');
+ 
+    // ── Age filter ────────────────────────────────────────────────────────────
     if (minAge || maxAge) {
       filter.dateOfBirth = {};
       if (maxAge) filter.dateOfBirth.$gte = new Date(Date.now() - maxAge * 365.25 * 86400000);
       if (minAge) filter.dateOfBirth.$lte = new Date(Date.now() - minAge * 365.25 * 86400000);
     }
-
+ 
     const skip  = (Number(page) - 1) * Number(limit);
-    const total = await User.countDocuments(filter);
-    const users = await User.find(filter)
-      .select('name dateOfBirth city country profession interests bio religion education profilePicture photos isOnline lookingFor verificationBadge isVerified')
-      .skip(skip)
-      .limit(Number(limit))
-      .lean();
+    let users   = [];
+    let total   = 0;
+ 
+    // ── GPS-based nearby search ───────────────────────────────────────────────
+    if (lat && lng && tab === 'nearby') {
+      console.log(`📍 [Search] GPS nearby: ${lat}, ${lng} within ${radius}km`);
+ 
+      const geoResults = await User.aggregate([
+        {
+          $geoNear: {
+            near:          { type: 'Point', coordinates: [parseFloat(lng), parseFloat(lat)] },
+            distanceField: 'distance',
+            maxDistance:   Number(radius) * 1000, // km → meters
+            spherical:     true,
+            query:         filter,
+          },
+        },
+        { $skip:  skip },
+        { $limit: Number(limit) },
+        {
+          $project: {
+            name: 1, dateOfBirth: 1, city: 1, country: 1,
+            profession: 1, interests: 1, bio: 1, religion: 1,
+            education: 1, profilePicture: 1, photos: 1, introVideo: 1,
+            isOnline: 1, lookingFor: 1, isVerified: 1, distance: 1,
+          },
+        },
+      ]);
+ 
+      if (geoResults.length > 0) {
+        users = geoResults.map((u) => ({
+          ...u,
+          distanceKm: u.distance ? `${(u.distance / 1000).toFixed(1)} km away` : null,
+        }));
+        total = await User.countDocuments(filter);
+      } else {
+        // GPS found nothing (users likely have no coordinates stored) — fall back to country-based search
+        console.log(`📍 [Search] GPS returned 0 — falling back to country-based search`);
+        const fallbackFilter = { ...filter };
+        if (req.user.country) fallbackFilter.country = new RegExp(req.user.country, 'i');
+        total = await User.countDocuments(fallbackFilter);
+        users = await User.find(fallbackFilter)
+          .select('name dateOfBirth city country profession interests bio religion education profilePicture photos introVideo isOnline lookingFor verificationBadge isVerified')
+          .skip(skip)
+          .limit(Number(limit))
+          .lean();
+      }
 
-    console.log(`✅ [Search] Found ${users.length} users (page ${page})`);
-
+    } else {
+      // Standard query
+      total = await User.countDocuments(filter);
+      users = await User.find(filter)
+        .select('name dateOfBirth city country profession interests bio religion education profilePicture photos introVideo isOnline lookingFor verificationBadge isVerified')
+        .skip(skip)
+        .limit(Number(limit))
+        .lean();
+    }
+ 
+    console.log(`✅ [Search] Found ${users.length} users (tab: ${tab || 'none'}, page: ${page})`);
+ 
     res.status(200).json({
-      success: true,
+      success:    true,
       users,
       total,
       page:       Number(page),
       totalPages: Math.ceil(total / Number(limit)),
       hasMore:    skip + users.length < total,
     });
+ 
   } catch (error) {
     console.error('❌ [Search] Error:', error.message);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
+
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/users/:id
@@ -96,14 +193,22 @@ exports.updateProfile = async (req, res) => {
       'name', 'bio', 'profession', 'religion', 'interests',
       'city', 'country', 'isProfileHidden', 'lookingFor',
       'education', 'drink', 'smoke', 'height',
+      'profilePicture', 'photos', 'introVideo', 'location'
     ];
+
     const updates = Object.fromEntries(
       Object.entries(req.body).filter(([k]) => allowed.includes(k))
     );
 
-    const user = await User.findByIdAndUpdate(req.user._id, updates, {
-      new: true, runValidators: true,
-    }).select('-password -otp -otpExpires');
+    console.log('📝 [UpdateProfile] Saving:', updates); // ← add this log
+
+    const user = await User.findByIdAndUpdate(
+      req.user._id,
+      { $set: updates },   // ← use $set explicitly
+      { new: true, runValidators: false }  // ← disable validators to prevent silent failures
+    ).select('-password -otp -otpExpires');
+
+    console.log('✅ [UpdateProfile] Saved introVideo:', user.introVideo); // ← verify
 
     res.status(200).json({ success: true, user });
   } catch (error) {
@@ -160,4 +265,5 @@ exports.reportUser = async (req, res) => {
     console.error('❌ [ReportUser] Error:', error.message);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
-};
+}; 
+ 

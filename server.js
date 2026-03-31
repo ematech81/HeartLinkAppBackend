@@ -1,177 +1,151 @@
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const morgan = require('morgan');
-require('dotenv').config();
+const express    = require('express');
+const http       = require('http');
+const { Server } = require('socket.io');
+const cors       = require('cors');
+const helmet     = require('helmet');
+const dotenv     = require('dotenv');
+const connectDB  = require('./config/db');
 
-const connectDB = require('./config/db');
-const authRoutes  = require('./routes/authRoutes');
-const userRoutes  = require('./routes/userRoutes');
-const matchRoutes = require('./routes/matchRoutes');
-const messageRoutes = require('./routes/messageRoutes');
-
-// ── Connect to MongoDB ────────────────────────────────────────────────────────
+dotenv.config();
 connectDB();
 
-const app = express();
+const app    = express();
+const server = http.createServer(app);
 
-// ── Security middleware ───────────────────────────────────────────────────────
+// ── Socket.io ─────────────────────────────────────────────────────────────────
+const io = new Server(server, {
+  cors: {
+    origin:  process.env.NODE_ENV === 'development' ? '*' : process.env.CLIENT_URL,
+    methods: ['GET', 'POST'],
+  },
+  pingTimeout:  60000,
+  pingInterval: 25000,
+});
+
+// Make io accessible in controllers
+app.set('io', io);
+
+// ── Track online users ────────────────────────────────────────────────────────
+const onlineUsers = new Map(); // userId → socketId
+
+io.on('connection', (socket) => {
+  console.log(`🔌 Socket connected: ${socket.id}`);
+
+  // ── User joins — mark online ───────────────────────────────────────────────
+  socket.on('user:join', (userId) => {
+    if (!userId) return;
+    onlineUsers.set(userId, socket.id);
+    socket.join(userId); // join personal room
+    console.log(`✅ [Socket] ${userId} online (${onlineUsers.size} total)`);
+
+    // Broadcast online status to others
+    socket.broadcast.emit('user:online', { userId });
+  });
+
+  // ── Join a chat room ───────────────────────────────────────────────────────
+  socket.on('chat:join', ({ userId, otherUserId }) => {
+    const roomId = getRoomId(userId, otherUserId);
+    socket.join(roomId);
+    console.log(`💬 [Socket] ${userId} joined room ${roomId}`);
+  });
+
+  // ── Send message ───────────────────────────────────────────────────────────
+  socket.on('message:send', (data) => {
+    const { senderId, receiverId, message, tempId } = data;
+    if (!senderId || !receiverId || !message) return;
+
+    const roomId = getRoomId(senderId, receiverId);
+    const payload = {
+      _id:       tempId || Date.now().toString(),
+      content:   message,
+      sender:    senderId,
+      receiver:  receiverId,
+      createdAt: new Date().toISOString(),
+      isRead:    false,
+    };
+
+    // Emit to both users in the room
+    io.to(roomId).emit('message:receive', payload);
+
+    // Also notify receiver's personal room (for MessagesScreen badge update)
+    io.to(receiverId).emit('conversation:update', {
+      senderId,
+      lastMessage: message,
+      timestamp:   payload.createdAt,
+    });
+
+    console.log(`📨 [Socket] ${senderId} → ${receiverId}: "${message.substring(0, 30)}"`);
+  });
+
+  // ── Typing indicators ──────────────────────────────────────────────────────
+  socket.on('typing:start', ({ senderId, receiverId }) => {
+    socket.to(getRoomId(senderId, receiverId)).emit('typing:start', { senderId });
+  });
+
+  socket.on('typing:stop', ({ senderId, receiverId }) => {
+    socket.to(getRoomId(senderId, receiverId)).emit('typing:stop', { senderId });
+  });
+
+  // ── Mark messages as read ──────────────────────────────────────────────────
+  socket.on('message:read', ({ readerId, senderId }) => {
+    socket.to(senderId).emit('message:read', { readerId });
+  });
+
+  // ── Disconnect ─────────────────────────────────────────────────────────────
+  socket.on('disconnect', () => {
+    // Find and remove the disconnected user
+    for (const [userId, socketId] of onlineUsers.entries()) {
+      if (socketId === socket.id) {
+        onlineUsers.delete(userId);
+        socket.broadcast.emit('user:offline', { userId });
+        console.log(`❌ [Socket] ${userId} offline`);
+        break;
+      }
+    }
+  });
+});
+
+// ── Helper: consistent room ID for two users ──────────────────────────────────
+function getRoomId(userId1, userId2) {
+  return [userId1, userId2].sort().join('_');
+}
+
+// ── Middleware ────────────────────────────────────────────────────────────────
 app.use(helmet());
 app.use(cors({
-  origin: process.env.CLIENT_URL || '*',
+  origin:  process.env.NODE_ENV === 'development' ? '*' : process.env.CLIENT_URL,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
-
-// ── Rate limiting ─────────────────────────────────────────────────────────────
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100,
-  message: { success: false, message: 'Too many requests. Please try again later.' },
-});
-
-// Stricter limiter for auth routes
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  message: { success: false, message: 'Too many attempts. Please wait 15 minutes.' },
-});
-
-app.use('/api/', limiter);
-app.use('/api/auth/', authLimiter);
-
-// ── Body parsing ──────────────────────────────────────────────────────────────
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// ── Logging (dev only) ────────────────────────────────────────────────────────
-if (process.env.NODE_ENV === 'development') {
-  app.use(morgan('dev'));
-}
+// ── Health check ──────────────────────────────────────────────────────────────
+app.get('/health', (req, res) =>
+  res.json({ success: true, message: 'HeartLink API is running', onlineUsers: onlineUsers.size })
+);
 
 // ── Routes ────────────────────────────────────────────────────────────────────
-app.use('/api/auth',    authRoutes);
-app.use('/api/users',   userRoutes);
-app.use('/api/matches', matchRoutes);
-app.use('/api/messages', messageRoutes);
+const authRoutes    = require('./routes/authRoutes');
+const userRoutes    = require('./routes/userRoutes');
+const matchRoutes   = require('./routes/matchRoutes');
+const messageRoutes = require('./routes/messageRoutes');
+const uploadRoutes  = require('./routes/uploadRoutes');
 
-// ── Health check ──────────────────────────────────────────────────────────────
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    success: true,
-    message: 'HeartLink API is running',
-    environment: process.env.NODE_ENV,
-    timestamp: new Date().toISOString(),
-  });
-});
+app.use('/api/auth',     authRoutes);
+app.use('/api/users',    userRoutes);
+app.use('/api/matches',  matchRoutes);
+app.use('/api/messages', messageRoutes);
+app.use('/api/upload',   uploadRoutes);
 
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ success: false, message: `Route ${req.originalUrl} not found.` });
 });
 
-// ── Global error handler ──────────────────────────────────────────────────────
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(err.statusCode || 500).json({
-    success: false,
-    message: err.message || 'Internal server error.',
-  });
-});
-
 // ── Start server ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 HeartLink server running on port ${PORT} in ${process.env.NODE_ENV} mode`);
+  console.log(`🔌 Socket.io ready`);
 });
-
-
-
-
-
-// const express = require('express');
-// const cors = require('cors');
-// const helmet = require('helmet');
-// const rateLimit = require('express-rate-limit');
-// const morgan = require('morgan');
-// require('dotenv').config();
-
-// const connectDB = require('./config/Db');
-// const authRoutes = require('./routes/AuthRoutes');
-// const userRoutes  = require('./routes/userRoutes');
-// const matchRoutes = require('./routes/matchRoutes');
- 
-// // ── Connect to MongoDB ────────────────────────────────────────────────────────
-// connectDB();
- 
-// const app = express();
- 
-// // ── Security middleware ───────────────────────────────────────────────────────
-// app.use(helmet());
-// app.use(cors({
-//   origin: process.env.CLIENT_URL || '*',
-//   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
-//   allowedHeaders: ['Content-Type', 'Authorization'],
-// }));
- 
-// // ── Rate limiting ─────────────────────────────────────────────────────────────
-// const limiter = rateLimit({
-//   windowMs: 15 * 60 * 1000, // 15 minutes
-//   max: 100,
-//   message: { success: false, message: 'Too many requests. Please try again later.' },
-// });
- 
-// // Stricter limiter for auth routes
-// const authLimiter = rateLimit({
-//   windowMs: 15 * 60 * 1000,
-//   max: 20,
-//   message: { success: false, message: 'Too many attempts. Please wait 15 minutes.' },
-// });
- 
-// app.use('/api/', limiter);
-// app.use('/api/auth/', authLimiter);
- 
-// // ── Body parsing ──────────────────────────────────────────────────────────────
-// app.use(express.json({ limit: '10mb' }));
-// app.use(express.urlencoded({ extended: true, limit: '10mb' }));
- 
-// // ── Logging (dev only) ────────────────────────────────────────────────────────
-// if (process.env.NODE_ENV === 'development') {
-//   app.use(morgan('dev'));
-// }
- 
-// // ── Routes ────────────────────────────────────────────────────────────────────
-// app.use('/api/auth',    authRoutes);
-// app.use('/api/users',   userRoutes);
-// app.use('/api/matches', matchRoutes);
- 
-// // ── Health check ──────────────────────────────────────────────────────────────
-// app.get('/health', (req, res) => {
-//   res.status(200).json({
-//     success: true,
-//     message: 'HeartLink API is running',
-//     environment: process.env.NODE_ENV,
-//     timestamp: new Date().toISOString(),
-//   });
-// });
- 
-// // ── 404 handler ───────────────────────────────────────────────────────────────
-// app.use((req, res) => {
-//   res.status(404).json({ success: false, message: `Route ${req.originalUrl} not found.` });
-// });
- 
-// // ── Global error handler ──────────────────────────────────────────────────────
-// app.use((err, req, res, next) => {
-//   console.error('Unhandled error:', err);
-//   res.status(err.statusCode || 500).json({
-//     success: false,
-//     message: err.message || 'Internal server error.',
-//   });
-// });
- 
-// // ── Start server ──────────────────────────────────────────────────────────────
-// const PORT = process.env.PORT || 5000;
-// app.listen(PORT, () => {
-//   console.log(`🚀 HeartLink server running on port ${PORT} in ${process.env.NODE_ENV} mode`);
-// });
