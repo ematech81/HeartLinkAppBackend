@@ -4,6 +4,7 @@ const User = require('../models/User');
 const { generateOtp, sendOtp } = require('../utils/SendOTP');
 const { sendPasswordResetEmail, sendEmail } = require('../utils/SendEmail');
 const twilio = require('twilio');
+const { OAuth2Client } = require('google-auth-library');
 
 
 
@@ -21,7 +22,7 @@ const signToken = (id) =>
   });
  
 // ── Strip sensitive fields and send response ──────────────────────────────────
-const sendTokenResponse = (user, statusCode, res) => {
+const sendTokenResponse = (user, statusCode, res, extra = {}) => {
   const token = signToken(user._id);
   const userObj = user.toObject ? user.toObject() : { ...user };
   delete userObj.password;
@@ -29,8 +30,8 @@ const sendTokenResponse = (user, statusCode, res) => {
   delete userObj.otpExpires;
   delete userObj.resetPasswordToken;
   delete userObj.resetPasswordExpires;
- 
-  res.status(statusCode).json({ success: true, token, user: userObj });
+
+  res.status(statusCode).json({ success: true, token, user: userObj, ...extra });
 };
  
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1148,3 +1149,69 @@ exports.resetPassword = async (req, res) => {
 //   getMe: exports.getMe,
 //   logout: exports.logout,
 // };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/auth/google
+// Verify a Google ID token, then find-or-create the user.
+// Body: { idToken: string }
+// Returns: { token, user, isNewUser }
+// ─────────────────────────────────────────────────────────────────────────────
+exports.googleAuth = async (req, res) => {
+  try {
+    const { idToken } = req.body;
+    if (!idToken) {
+      return res.status(400).json({ success: false, message: 'idToken is required.' });
+    }
+
+    // Verify the token with Google
+    const client  = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+    let payload;
+    try {
+      const ticket = await client.verifyIdToken({
+        idToken,
+        audience: process.env.GOOGLE_CLIENT_ID,
+      });
+      payload = ticket.getPayload();
+    } catch {
+      return res.status(401).json({ success: false, message: 'Invalid Google token.' });
+    }
+
+    const { sub: googleId, email, name, picture } = payload;
+
+    // ── Find existing user by Google ID or email ──────────────────────────────
+    let user = await User.findOne({ $or: [{ googleId }, { email: email?.toLowerCase() }] });
+    let isNewUser = false;
+
+    if (user) {
+      // Existing user — link googleId if not already set
+      if (!user.googleId) {
+        user.googleId     = googleId;
+        user.authProvider = 'google';
+        await user.save();
+      }
+    } else {
+      // New user — create a minimal record; profile completion happens in-app
+      isNewUser = true;
+      user = await User.create({
+        name,
+        email:             email?.toLowerCase(),
+        googleId,
+        authProvider:      'google',
+        profilePicture:    picture || null,
+        isEmailVerified:   true,   // Google emails are verified
+        isProfileComplete: false,
+        // password not required for Google users
+      });
+    }
+
+    if (user.isBanned) {
+      return res.status(403).json({ success: false, message: 'Your account has been suspended.' });
+    }
+
+    console.log(`✅ [Google Auth] ${isNewUser ? 'New' : 'Existing'} user: ${email}`);
+    sendTokenResponse(user, 200, res, { isNewUser });
+  } catch (err) {
+    console.error('❌ [Google Auth] Error:', err.message);
+    res.status(500).json({ success: false, message: 'Google authentication failed.' });
+  }
+};

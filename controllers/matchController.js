@@ -189,3 +189,20 @@ exports.getLikes = async (req, res) => {
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /api/matches/likes/:likeId
+// Dismiss / remove a like from your received list
+// ─────────────────────────────────────────────────────────────────────────────
+exports.removeLike = async (req, res) => {
+  try {
+    const like = await Like.findOne({ _id: req.params.likeId, receiver: req.user._id });
+    if (!like) return res.status(404).json({ success: false, message: 'Like not found.' });
+
+    await like.deleteOne();
+    res.status(200).json({ success: true, message: 'Like removed.' });
+  } catch (error) {
+    console.error('❌ [RemoveLike] Error:', error.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};

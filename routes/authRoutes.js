@@ -9,12 +9,14 @@ const {
   verifyOtp,
   forgotPassword,
   resetPassword,
+  googleAuth,
 } = require('../controllers/AuthController');
 const { protect } = require('../middleware/AuthMiddleware');
 
 // ── Public routes ─────────────────────────────────────────────────────────────
 router.post('/register',         register);
 router.post('/login',            login);
+router.post('/google',           googleAuth);
 // router.post('/send-otp',         sendOtp);
 // router.post('/verify-otp',       verifyOtp);
 // router.post('/forgot-password',  forgotPassword);

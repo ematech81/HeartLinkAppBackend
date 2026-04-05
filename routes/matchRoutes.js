@@ -6,6 +6,7 @@ const {
   getMatches,
   unmatch,
   getLikes,
+  removeLike,
 } = require('../controllers/matchController');
 const { protect } = require('../middleware/authMiddleware');
 
@@ -13,6 +14,7 @@ router.post('/like/:userId',    protect, likeUser);
 router.post('/pass/:userId',    protect, passUser);
 router.get('/',                 protect, getMatches);
 router.get('/likes',            protect, getLikes);
+router.delete('/likes/:likeId', protect, removeLike);
 router.delete('/:matchId',      protect, unmatch);
 
 module.exports = router;

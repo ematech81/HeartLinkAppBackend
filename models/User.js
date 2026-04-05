@@ -80,9 +80,14 @@ const userSchema = new mongoose.Schema(
     introVideo: { type: String, default: null },
 
     // ── Verification ───────────────────────────────────────────────────────
-    isEmailVerified: { type: Boolean, default: false },
-    isPhoneVerified: { type: Boolean, default: false },
-    isVerified:      { type: Boolean, default: false },
+    isEmailVerified:   { type: Boolean, default: false },
+    isPhoneVerified:   { type: Boolean, default: false },
+    isVerified:        { type: Boolean, default: false },
+
+    // ── Social auth ────────────────────────────────────────────────────────
+    authProvider:      { type: String, enum: ['local', 'google'], default: 'local' },
+    googleId:          { type: String, default: null },
+    isProfileComplete: { type: Boolean, default: true }, // false for new Google sign-in users
 
     // ── OTP ────────────────────────────────────────────────────────────────
     otp:        { type: String,  select: false },
@@ -94,6 +99,15 @@ const userSchema = new mongoose.Schema(
 
     // ── Push notifications ─────────────────────────────────────────────────
     pushToken: { type: String, default: null },
+
+    // ── Subscription ───────────────────────────────────────────────────────────
+    isSubscribed:       { type: Boolean, default: false },
+    subscriptionExpiry: { type: Date,    default: null  },
+    subscriptionPlan:   { type: String,  enum: ['monthly', 'yearly'], default: null },
+
+    // ── Boost ──────────────────────────────────────────────────────────────────
+    isBoosted:   { type: Boolean, default: false },
+    boostExpiry: { type: Date,    default: null  },
 
     // ── Account status ─────────────────────────────────────────────────────
     isActive:        { type: Boolean, default: true },

@@ -54,7 +54,11 @@ exports.searchUsers = async (req, res) => {
     };
  
     // ── Tab filter ────────────────────────────────────────────────────────────
-    if (tab === 'global') {
+    if (tab === 'top') {
+      // Top Profiles: only currently-boosted users, sorted by boostExpiry
+      filter.isBoosted   = true;
+      filter.boostExpiry = { $gt: new Date() };
+    } else if (tab === 'global') {
       // Global: users from different countries
       if (req.user.country) {
         filter.country = { $not: new RegExp(`^${req.user.country}$`, 'i') };
@@ -125,17 +129,19 @@ exports.searchUsers = async (req, res) => {
         if (req.user.country) fallbackFilter.country = new RegExp(req.user.country, 'i');
         total = await User.countDocuments(fallbackFilter);
         users = await User.find(fallbackFilter)
-          .select('name dateOfBirth city country profession interests bio religion education profilePicture photos introVideo isOnline lookingFor verificationBadge isVerified')
+          .select('name dateOfBirth city country profession interests bio religion education profilePicture photos introVideo isOnline lookingFor verificationBadge isVerified isBoosted boostExpiry')
           .skip(skip)
           .limit(Number(limit))
           .lean();
       }
 
     } else {
-      // Standard query
+      // Standard query (top, global, default)
+      const SELECT_FIELDS = 'name dateOfBirth city country profession interests bio religion education profilePicture photos introVideo isOnline lookingFor verificationBadge isVerified isBoosted boostExpiry';
       total = await User.countDocuments(filter);
       users = await User.find(filter)
-        .select('name dateOfBirth city country profession interests bio religion education profilePicture photos introVideo isOnline lookingFor verificationBadge isVerified')
+        .select(SELECT_FIELDS)
+        .sort(tab === 'top' ? { boostExpiry: -1 } : {})
         .skip(skip)
         .limit(Number(limit))
         .lean();
@@ -193,7 +199,10 @@ exports.updateProfile = async (req, res) => {
       'name', 'bio', 'profession', 'religion', 'interests',
       'city', 'country', 'isProfileHidden', 'lookingFor',
       'education', 'drink', 'smoke', 'height',
-      'profilePicture', 'photos', 'introVideo', 'location'
+      'profilePicture', 'photos', 'introVideo', 'location',
+      // Google profile-completion fields
+      'gender', 'dateOfBirth', 'relationshipType',
+      'numberOfKids', 'kidsAges', 'isProfileComplete',
     ];
 
     const updates = Object.fromEntries(

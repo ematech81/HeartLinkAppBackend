@@ -9,6 +9,21 @@ const connectDB  = require('./config/db');
 dotenv.config();
 connectDB();
 
+// ── Daily expiry check (runs every 6 hours) ───────────────────────────────────
+const { runExpiryCheck } = require('./controllers/paymentController');
+const runDailyExpiry = async () => {
+  try {
+    const fakeReq = {};
+    const fakeRes = { json: (d) => console.log('⏰ [Cron] Expiry result:', d) };
+    await runExpiryCheck(fakeReq, fakeRes);
+  } catch (err) {
+    console.error('❌ [Cron] Expiry check failed:', err.message);
+  }
+};
+// Run once on startup, then every 6 hours
+setTimeout(runDailyExpiry, 5000);
+setInterval(runDailyExpiry, 6 * 60 * 60 * 1000);
+
 const app    = express();
 const server = http.createServer(app);
 
@@ -117,6 +132,13 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
+// Paystack webhook needs the raw body for HMAC verification — mount BEFORE json()
+app.use('/api/payment/webhook', express.raw({ type: 'application/json' }), (req, _res, next) => {
+  // Parse back to object so the handler can use req.body normally
+  if (Buffer.isBuffer(req.body)) req.body = JSON.parse(req.body.toString());
+  next();
+});
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -131,12 +153,14 @@ const userRoutes    = require('./routes/userRoutes');
 const matchRoutes   = require('./routes/matchRoutes');
 const messageRoutes = require('./routes/messageRoutes');
 const uploadRoutes  = require('./routes/uploadRoutes');
+const paymentRoutes = require('./routes/paymentRoutes');
 
 app.use('/api/auth',     authRoutes);
 app.use('/api/users',    userRoutes);
 app.use('/api/matches',  matchRoutes);
 app.use('/api/messages', messageRoutes);
 app.use('/api/upload',   uploadRoutes);
+app.use('/api/payment',  paymentRoutes);
 
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((req, res) => {
