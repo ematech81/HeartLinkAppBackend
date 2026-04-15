@@ -9,14 +9,12 @@ if (apiKey.startsWith('SG.')) {
 /**
  * Send a password reset email via SendGrid.
  */
-const sendPasswordResetEmail = async (to, resetToken, name) => {
+const sendPasswordResetEmail = async (to, resetCode, name) => {
   if (!apiKey.startsWith('SG.')) {
     console.log(`⚠️  [Email] SendGrid not configured — skipping reset email to ${to}`);
-    console.log(`🔑 [Email] Reset token for ${to}: ${resetToken}`); // log for dev
+    console.log(`🔑 [Email] Reset code for ${to}: ${resetCode}`);
     return;
   }
-
-  const resetUrl = `${process.env.CLIENT_URL}/reset-password?token=${resetToken}`;
 
   const msg = {
     to,
@@ -24,21 +22,22 @@ const sendPasswordResetEmail = async (to, resetToken, name) => {
       email: process.env.SENDGRID_FROM_EMAIL,
       name:  process.env.SENDGRID_FROM_NAME || 'HeartLink',
     },
-    subject: 'Reset Your HeartLink Password',
-    text: `Hi ${name},\n\nReset your password here: ${resetUrl}\n\nExpires in 1 hour.\n\nHeartLink Team`,
+    subject: 'Your HeartLink Password Reset Code',
+    text: `Hi ${name},\n\nYour password reset code is: ${resetCode}\n\nEnter this code in the app to reset your password. It expires in 1 hour.\n\nIf you did not request this, ignore this email.\n\nHeartLink Team`,
     html: `
       <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px">
         <h1 style="color:#FF4D6D;text-align:center">♥ HeartLink</h1>
         <div style="background:#fff;border-radius:12px;padding:30px;border:1px solid #F3F4F6">
           <h2 style="color:#1F2937">Reset Your Password</h2>
           <p style="color:#6B7280">Hi <strong>${name}</strong>,</p>
-          <p style="color:#6B7280">Click below to reset your HeartLink password.</p>
+          <p style="color:#6B7280">Enter the code below in the HeartLink app to reset your password.</p>
           <div style="text-align:center;margin:30px 0">
-            <a href="${resetUrl}" style="background:#FF4D6D;color:#fff;padding:14px 32px;text-decoration:none;border-radius:50px;font-weight:bold;font-size:16px;display:inline-block">
-              Reset Password
-            </a>
+            <div style="display:inline-block;background:#FFF1F3;border:2px solid #FF4D6D;border-radius:12px;padding:20px 40px">
+              <p style="margin:0;font-size:13px;color:#6B7280;letter-spacing:1px;text-transform:uppercase">Reset Code</p>
+              <p style="margin:8px 0 0;font-size:40px;font-weight:900;color:#FF4D6D;letter-spacing:8px">${resetCode}</p>
+            </div>
           </div>
-          <p style="color:#9CA3AF;font-size:14px">This link expires in <strong>1 hour</strong>.</p>
+          <p style="color:#9CA3AF;font-size:14px;text-align:center">Expires in <strong>1 hour</strong>. Do not share this code.</p>
         </div>
       </div>
     `,

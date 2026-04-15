@@ -5,6 +5,7 @@ const { generateOtp, sendOtp } = require('../utils/SendOTP');
 const { sendPasswordResetEmail, sendEmail } = require('../utils/SendEmail');
 const twilio = require('twilio');
 const { OAuth2Client } = require('google-auth-library');
+const axios = require('axios');
 
 
 
@@ -544,16 +545,21 @@ exports.forgotPassword = async (req, res) => {
       });
     }
  
-    const resetToken = crypto.randomBytes(32).toString('hex');
-    user.resetPasswordToken   = crypto.createHash('sha256').update(resetToken).digest('hex');
-    user.resetPasswordExpires = Date.now() + 60 * 60 * 1000;
+    // 6-digit code — easy for mobile users to type from email
+    const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
+    user.resetPasswordToken   = crypto.createHash('sha256').update(resetCode).digest('hex');
+    user.resetPasswordExpires = Date.now() + 60 * 60 * 1000; // 1 hour
     await user.save({ validateBeforeSave: false });
- 
-    await sendPasswordResetEmail(user.email, resetToken, user.name);
- 
+
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`🔑 [ResetPassword] DEV MODE — Code for ${email}: ${resetCode}`);
+    } else {
+      await sendPasswordResetEmail(user.email, resetCode, user.name);
+    }
+
     res.status(200).json({
       success: true,
-      message: 'If this email is registered, a reset link has been sent.',
+      message: 'If this email is registered, a reset code has been sent.',
     });
  
   } catch (error) {
@@ -1151,6 +1157,81 @@ exports.resetPassword = async (req, res) => {
 // };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// POST /api/auth/send-otp
+// Send a 6-digit OTP to the given phone number via Twilio SMS.
+// The user must already have an account with that phone number.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.sendOtp = async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) {
+      return res.status(400).json({ success: false, message: 'Phone number is required.' });
+    }
+
+    const user = await User.findOne({ phone });
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'No account found with this phone number.' });
+    }
+
+    if (user.isBanned) {
+      return res.status(403).json({ success: false, message: 'Your account has been suspended.' });
+    }
+
+    const otp        = generateOtp();
+    const otpExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    user.otp        = otp;
+    user.otpExpires = otpExpires;
+    await user.save({ validateBeforeSave: false });
+
+    if (process.env.NODE_ENV === 'production') {
+      await sendOtp(phone, otp);
+    } else {
+      // Development: log OTP to console instead of sending SMS
+      console.log(`📱 [OTP] *** DEV MODE — OTP for ${phone}: ${otp} ***`);
+    }
+    res.status(200).json({ success: true, message: 'OTP sent successfully.' });
+  } catch (err) {
+    console.error('❌ [OTP] sendOtp error:', err.message);
+    res.status(500).json({ success: false, message: err.message || 'Failed to send OTP.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/auth/verify-otp
+// Verify the OTP and return a JWT if valid.
+// Body: { phone, otp }
+// ─────────────────────────────────────────────────────────────────────────────
+exports.verifyOtp = async (req, res) => {
+  try {
+    const { phone, otp } = req.body;
+    if (!phone || !otp) {
+      return res.status(400).json({ success: false, message: 'Phone number and OTP are required.' });
+    }
+
+    const user = await User.findOne({ phone }).select('+otp +otpExpires');
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'No account found with this phone number.' });
+    }
+
+    if (!user.isOtpValid(otp)) {
+      return res.status(400).json({ success: false, message: 'Invalid or expired OTP.' });
+    }
+
+    // Clear OTP after successful verification
+    user.otp        = undefined;
+    user.otpExpires = undefined;
+    await user.save({ validateBeforeSave: false });
+
+    console.log(`✅ [OTP] Verified for ${phone}`);
+    sendTokenResponse(user, 200, res);
+  } catch (err) {
+    console.error('❌ [OTP] verifyOtp error:', err.message);
+    res.status(500).json({ success: false, message: 'OTP verification failed.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POST /api/auth/google
 // Verify a Google ID token, then find-or-create the user.
 // Body: { idToken: string }
@@ -1158,25 +1239,23 @@ exports.resetPassword = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 exports.googleAuth = async (req, res) => {
   try {
-    const { idToken } = req.body;
-    if (!idToken) {
-      return res.status(400).json({ success: false, message: 'idToken is required.' });
+    const { accessToken } = req.body;
+    if (!accessToken) {
+      return res.status(400).json({ success: false, message: 'accessToken is required.' });
     }
 
-    // Verify the token with Google
-    const client  = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
-    let payload;
+    // Verify the token by calling Google's userinfo endpoint
+    let googleUser;
     try {
-      const ticket = await client.verifyIdToken({
-        idToken,
-        audience: process.env.GOOGLE_CLIENT_ID,
+      const { data } = await axios.get('https://www.googleapis.com/userinfo/v2/me', {
+        headers: { Authorization: `Bearer ${accessToken}` },
       });
-      payload = ticket.getPayload();
+      googleUser = data;
     } catch {
-      return res.status(401).json({ success: false, message: 'Invalid Google token.' });
+      return res.status(401).json({ success: false, message: 'Invalid Google access token.' });
     }
 
-    const { sub: googleId, email, name, picture } = payload;
+    const { id: googleId, email, name, picture } = googleUser;
 
     // ── Find existing user by Google ID or email ──────────────────────────────
     let user = await User.findOne({ $or: [{ googleId }, { email: email?.toLowerCase() }] });
