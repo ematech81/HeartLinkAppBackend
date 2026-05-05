@@ -9,14 +9,16 @@ const POST_EXPIRY_HOURS = 24;
 // ─────────────────────────────────────────────────────────────────────────────
 exports.createPost = async (req, res) => {
   try {
-    const user = await User.findById(req.user._id).select('isBoosted boostExpiry');
+    const user = await User.findById(req.user._id).select('isSubscribed subscriptionExpiry isBoosted boostExpiry');
 
-    const isBoosted = user.isBoosted && user.boostExpiry > new Date();
-    if (!isBoosted) {
+    const isSubscribed = user.isSubscribed && (!user.subscriptionExpiry || user.subscriptionExpiry > new Date());
+    const isBoosted    = user.isBoosted    && user.boostExpiry > new Date();
+
+    if (!isSubscribed && !isBoosted) {
       return res.status(403).json({
         success: false,
-        message: 'Only boosted users can post. Boost your profile to share content.',
-        requiresBoost: true,
+        message: 'Subscribe to HeartLink Premium to post in the Community.',
+        requiresSubscription: true,
       });
     }
 
@@ -66,7 +68,7 @@ exports.getFeed = async (req, res) => {
     const filter = {
       isActive:  true,
       expiresAt: { $gt: now },
-      author:    { $ne: req.user._id },
+      // own posts included — frontend renders them with owner UI (analytics bar, delete)
     };
 
     const posts = await Post.find(filter)
