@@ -11,7 +11,7 @@ const {
   resetPassword,
   googleAuth,
 } = require('../controllers/AuthController');
-const { protect } = require('../middleware/AuthMiddleware');
+const { protect } = require('../middleware/authMiddleware');
 
 // ── Public routes ─────────────────────────────────────────────────────────────
 router.post('/register',        register);
