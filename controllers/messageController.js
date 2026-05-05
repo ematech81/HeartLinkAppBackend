@@ -88,13 +88,16 @@ exports.getMessages = async (req, res) => {
     const page  = parseInt(req.query.page)  || 1;
     const limit = parseInt(req.query.limit) || 30;
 
-    // Verify they are matched
+    // Subscribed users can view messages with anyone (Community direct-message feature)
+    const reqUser = await User.findById(currentUserId).select('isSubscribed subscriptionExpiry');
+    const isSubscribed = reqUser?.isSubscribed && (!reqUser.subscriptionExpiry || reqUser.subscriptionExpiry > new Date());
+
     const match = await Match.findOne({
       users:    { $all: [currentUserId, otherUserId] },
       isActive: true,
     });
 
-    if (!match) {
+    if (!match && !isSubscribed) {
       return res.status(403).json({
         success: false,
         message: 'You must be matched to view messages.',
@@ -149,7 +152,7 @@ exports.getMessages = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/messages/:receiverId
-// Send a message (matched users only)
+// Send a message — matched users, OR subscribed users (Community direct-message)
 // ─────────────────────────────────────────────────────────────────────────────
 exports.sendMessage = async (req, res) => {
   try {
@@ -167,24 +170,27 @@ exports.sendMessage = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Receiver not found.' });
     }
 
-    // Verify they are matched
+    // Subscribed users can message anyone (Community direct-message is a paid feature)
+    const senderUser  = await User.findById(senderId).select('isSubscribed subscriptionExpiry');
+    const isSubscribed = senderUser?.isSubscribed && (!senderUser.subscriptionExpiry || senderUser.subscriptionExpiry > new Date());
+
     const match = await Match.findOne({
       users:    { $all: [senderId, receiverId] },
       isActive: true,
     });
 
-    if (!match) {
+    if (!match && !isSubscribed) {
       return res.status(403).json({
         success: false,
         message: 'You must be matched to send messages.',
       });
     }
 
-    // Create message
+    // Create message (matchId is optional — absent when messaging via Community)
     const message = await Message.create({
       sender:   senderId,
       receiver: receiverId,
-      matchId:  match._id,
+      ...(match ? { matchId: match._id } : {}),
       content:  content.trim(),
       type,
     });
