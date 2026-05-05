@@ -3,7 +3,7 @@ const router  = express.Router();
 const {
   initializePayment,
   verifyPayment,
-  paystackWebhook,
+  flutterwaveWebhook,
   subscribe,
   boostProfile,
   getTopProfiles,
@@ -12,14 +12,14 @@ const {
 } = require('../controllers/paymentController');
 const { protect } = require('../middleware/authMiddleware');
 
-// ── Paystack checkout flow ────────────────────────────────────────────────────
-router.post('/initialize',   protect, initializePayment); // Step 1 — get checkout URL
+// ── Flutterwave checkout flow ─────────────────────────────────────────────────
+router.post('/initialize',   protect, initializePayment); // Step 1 — get checkout link
 router.post('/verify',       protect, verifyPayment);     // Step 2 — confirm payment
-router.post('/webhook',      paystackWebhook);            // Paystack server webhook (no auth)
+router.post('/webhook',      flutterwaveWebhook);         // Flutterwave server webhook (no auth)
 
-// ── Legacy / internal ─────────────────────────────────────────────────────────
-router.post('/subscribe',    protect, subscribe);         // kept for compat
-router.post('/boost',        protect, boostProfile);      // kept for compat
+// ── Internal / admin ──────────────────────────────────────────────────────────
+router.post('/subscribe',    protect, subscribe);         // direct activation (no payment)
+router.post('/boost',        protect, boostProfile);      // direct boost (no payment)
 
 // ── Info & cron ───────────────────────────────────────────────────────────────
 router.get('/top-profiles',  protect, getTopProfiles);

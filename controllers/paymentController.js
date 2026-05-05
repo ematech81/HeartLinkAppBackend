@@ -3,49 +3,76 @@ const User  = require('../models/User');
 const sendPushNotification = require('../utils/pushNotification');
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Paystack helpers
+// Flutterwave config
 // ─────────────────────────────────────────────────────────────────────────────
-const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
+const FLW_SECRET      = process.env.FLW_SECRET_KEY;
+const FLW_WEBHOOK_HASH = process.env.FLW_WEBHOOK_HASH;
+const FLW_BASE        = 'https://api.flutterwave.com/v3';
 
-const paystackHeaders = () => ({
-  Authorization: `Bearer ${PAYSTACK_SECRET}`,
+const flwHeaders = () => ({
+  Authorization: `Bearer ${FLW_SECRET}`,
   'Content-Type': 'application/json',
 });
 
-// Convert Naira → Kobo (Paystack uses the smallest currency unit)
-const toKobo = (naira) => naira * 100;
-
 // ─────────────────────────────────────────────────────────────────────────────
-// Constants — all amounts in Naira (₦)
+// Plans — amounts in Naira (Flutterwave uses actual amount, not kobo)
 // ─────────────────────────────────────────────────────────────────────────────
 const PLANS = {
   monthly: {
     label:       'Monthly',
-    amount:      5000,           // ₦5,000
+    amount:      5000,
     durationMs:  30 * 24 * 60 * 60 * 1000,
     freeBoostMs: 0,
   },
   yearly: {
     label:       'Yearly',
-    amount:      20000,          // ₦20,000
+    amount:      20000,
     durationMs:  365 * 24 * 60 * 60 * 1000,
-    freeBoostMs: 7 * 24 * 60 * 60 * 1000,   // 1 week free boost
+    freeBoostMs: 7 * 24 * 60 * 60 * 1000,
   },
   boost: {
     label:       'Weekly Boost',
-    amount:      3000,           // ₦3,000
+    amount:      3000,
     durationMs:  7 * 24 * 60 * 60 * 1000,
   },
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper: check if a date is still in the future
-// ─────────────────────────────────────────────────────────────────────────────
-const stillActive = (expiry) => expiry && new Date(expiry) > new Date();
+const stillActive    = (expiry) => expiry && new Date(expiry) > new Date();
+const makeTxRef      = (userId) => `HL-${userId}-${Date.now()}`;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helper: expire stale fields on a user document
-// Called on status reads so the DB stays consistent without a cron job.
+// Helper: activate a plan on the user document
+// ─────────────────────────────────────────────────────────────────────────────
+const activatePlan = async (userId, plan) => {
+  const cfg = PLANS[plan];
+  const now = Date.now();
+  let fields = {};
+
+  if (plan === 'boost') {
+    fields = {
+      isBoosted:   true,
+      boostExpiry: new Date(now + cfg.durationMs),
+      isVerified:  true,
+    };
+  } else {
+    fields = {
+      isSubscribed:       true,
+      subscriptionExpiry: new Date(now + cfg.durationMs),
+      subscriptionPlan:   plan,
+      isVerified:         true,
+    };
+    if (plan === 'yearly') {
+      fields.isBoosted   = true;
+      fields.boostExpiry = new Date(now + cfg.freeBoostMs);
+    }
+  }
+
+  return User.findByIdAndUpdate(userId, fields, { new: true })
+    .select('-password -otp -otpExpires -resetPasswordToken -resetPasswordExpires');
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: expire stale subscription / boost fields on demand
 // ─────────────────────────────────────────────────────────────────────────────
 const expireIfNeeded = async (userId) => {
   const user = await User.findById(userId).select(
@@ -59,10 +86,8 @@ const expireIfNeeded = async (userId) => {
     updates.isSubscribed = false;
     console.log(`⏰ [Expiry] Subscription expired for ${userId}`);
   }
-
   if (user.isBoosted && !stillActive(user.boostExpiry)) {
     updates.isBoosted = false;
-    // Only remove verified badge if they haven't a paid subscription keeping it
     if (!user.isSubscribed || !stillActive(user.subscriptionExpiry)) {
       updates.isVerified = false;
     }
@@ -76,7 +101,7 @@ const expireIfNeeded = async (userId) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/initialize
-// Step 1: Create a Paystack transaction and return the checkout URL.
+// Creates a Flutterwave hosted-checkout link and returns it to the app.
 // Body: { plan: 'monthly' | 'yearly' | 'boost' }
 // ─────────────────────────────────────────────────────────────────────────────
 exports.initializePayment = async (req, res) => {
@@ -85,114 +110,93 @@ exports.initializePayment = async (req, res) => {
     if (!PLANS[plan]) {
       return res.status(400).json({ success: false, message: 'Invalid plan.' });
     }
-
-    if (!PAYSTACK_SECRET) {
-      console.error('❌ [Paystack] PAYSTACK_SECRET_KEY is not set in .env');
+    if (!FLW_SECRET) {
+      console.error('❌ [Flutterwave] FLW_SECRET_KEY is not set in .env');
       return res.status(500).json({ success: false, message: 'Payment service not configured.' });
     }
 
     const cfg    = PLANS[plan];
     const user   = await User.findById(req.user._id).select('email name');
-    const amount = toKobo(cfg.amount);
+    const tx_ref = makeTxRef(req.user._id);
 
-    console.log(`💳 [Paystack] Initializing plan="${plan}" amount=${amount} for user=${req.user._id}`);
+    console.log(`💳 [FLW] Initializing plan="${plan}" amount=₦${cfg.amount} for user=${req.user._id} tx_ref=${tx_ref}`);
 
     const { data } = await axios.post(
-      'https://api.paystack.co/transaction/initialize',
+      `${FLW_BASE}/payments`,
       {
-        email:        user.email,
-        amount,
+        tx_ref,
+        amount:       cfg.amount,
         currency:     'NGN',
-        callback_url: 'https://heartlink.app/payment/callback',
-        metadata: {
-          userId:    req.user._id.toString(),
+        redirect_url: 'https://heartlink.app/payment/callback',
+        customer: {
+          email: user.email,
+          name:  user.name,
+        },
+        customizations: {
+          title:       `HeartLink ${cfg.label}`,
+          description: `${cfg.label} plan — ₦${cfg.amount.toLocaleString()}`,
+        },
+        meta: {
+          userId: req.user._id.toString(),
           plan,
-          userName:  user.name,
         },
       },
-      { headers: paystackHeaders() }
+      { headers: flwHeaders() }
     );
 
-    if (!data.status) {
-      return res.status(502).json({ success: false, message: 'Paystack initialization failed.' });
+    if (data.status !== 'success') {
+      return res.status(502).json({ success: false, message: 'Flutterwave initialization failed.' });
     }
 
     res.json({
-      success:           true,
-      authorization_url: data.data.authorization_url,
-      reference:         data.data.reference,
-      amount:            cfg.amount,
+      success:      true,
+      payment_link: data.data.link,
+      tx_ref,
+      amount:       cfg.amount,
       plan,
     });
   } catch (err) {
     const detail = err.response?.data || err.message;
-    console.error('❌ [Paystack] Initialize error:', JSON.stringify(detail));
-    const msg = err.response?.data?.message || 'Could not start payment.';
-    res.status(500).json({ success: false, message: msg });
+    console.error('❌ [FLW] Initialize error:', JSON.stringify(detail));
+    res.status(500).json({ success: false, message: err.response?.data?.message || 'Could not start payment.' });
   }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/verify
-// Step 2: Verify the Paystack reference, then activate the plan.
-// Body: { reference, plan }
+// Verifies the tx_ref with Flutterwave and activates the plan.
+// Body: { tx_ref, plan }
 // ─────────────────────────────────────────────────────────────────────────────
 exports.verifyPayment = async (req, res) => {
   try {
-    const { reference, plan } = req.body;
-    if (!reference || !plan) {
-      return res.status(400).json({ success: false, message: 'reference and plan are required.' });
+    const { tx_ref, plan } = req.body;
+    if (!tx_ref || !plan) {
+      return res.status(400).json({ success: false, message: 'tx_ref and plan are required.' });
     }
     if (!PLANS[plan]) {
       return res.status(400).json({ success: false, message: 'Invalid plan.' });
     }
 
-    // Verify with Paystack
     const { data } = await axios.get(
-      `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,
-      { headers: paystackHeaders() }
+      `${FLW_BASE}/transactions/verify_by_reference?tx_ref=${encodeURIComponent(tx_ref)}`,
+      { headers: flwHeaders() }
     );
 
-    if (!data.status || data.data.status !== 'success') {
+    if (data.status !== 'success' || data.data?.status !== 'successful') {
       return res.status(402).json({ success: false, message: 'Payment not completed.' });
     }
 
-    const cfg     = PLANS[plan];
-    const paid    = data.data.amount; // in kobo
-    const expected = toKobo(cfg.amount);
-
-    // Guard: ensure the amount actually paid matches the plan price
+    // Guard: amount paid must match plan price
+    const paid     = data.data.amount;
+    const expected = PLANS[plan].amount;
     if (paid < expected) {
       return res.status(402).json({ success: false, message: 'Payment amount mismatch.' });
     }
 
-    // Activate subscription or boost
-    const now    = Date.now();
-    let updateFields = {};
+    const user = await activatePlan(req.user._id, plan);
+    console.log(`✅ [FLW] ${req.user._id} verified & activated plan="${plan}" tx_ref="${tx_ref}"`);
 
-    if (plan === 'boost') {
-      const expiry = new Date(now + cfg.durationMs);
-      updateFields = { isBoosted: true, boostExpiry: expiry, isVerified: true };
-    } else {
-      const expiry = new Date(now + cfg.durationMs);
-      updateFields = {
-        isSubscribed:       true,
-        subscriptionExpiry: expiry,
-        subscriptionPlan:   plan,
-        isVerified:         true,   // all subscribers get the verified badge
-      };
-      if (plan === 'yearly') {
-        updateFields.isBoosted   = true;
-        updateFields.boostExpiry = new Date(now + cfg.freeBoostMs);
-      }
-    }
-
-    const user = await User.findByIdAndUpdate(req.user._id, updateFields, { new: true })
-      .select('-password -otp -otpExpires -resetPasswordToken -resetPasswordExpires');
-
-    console.log(`✅ [Paystack] ${req.user._id} verified & activated plan="${plan}" ref="${reference}"`);
-
-    const isPlan = plan !== 'boost';
+    const cfg = PLANS[plan];
     res.json({
       success: true,
       message: plan === 'yearly'
@@ -202,61 +206,38 @@ exports.verifyPayment = async (req, res) => {
           : 'Profile boost activated for 7 days!',
       plan,
       amount:             cfg.amount,
-      subscriptionExpiry: updateFields.subscriptionExpiry || null,
-      boostExpiry:        updateFields.boostExpiry || null,
+      subscriptionExpiry: user.subscriptionExpiry || null,
+      boostExpiry:        user.boostExpiry        || null,
       user,
     });
   } catch (err) {
-    console.error('❌ [Paystack] Verify error:', err.response?.data || err.message);
+    console.error('❌ [FLW] Verify error:', err.response?.data || err.message);
     res.status(500).json({ success: false, message: 'Payment verification failed.' });
   }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/payment/webhook  (Paystack → backend, signature-verified)
-// Handles charge.success events as a reliable server-side fallback.
+// POST /api/payment/webhook  (Flutterwave → backend, hash-verified)
+// Set the same FLW_WEBHOOK_HASH in your Flutterwave dashboard under
+// Settings → Webhooks → Secret Hash.
 // ─────────────────────────────────────────────────────────────────────────────
-exports.paystackWebhook = async (req, res) => {
+exports.flutterwaveWebhook = async (req, res) => {
   try {
-    const crypto = require('crypto');
-    const hash   = crypto
-      .createHmac('sha512', PAYSTACK_SECRET)
-      .update(JSON.stringify(req.body))
-      .digest('hex');
-
-    if (hash !== req.headers['x-paystack-signature']) {
+    // Verify the request is genuinely from Flutterwave
+    const incomingHash = req.headers['verif-hash'];
+    if (!incomingHash || incomingHash !== FLW_WEBHOOK_HASH) {
       return res.status(401).send('Unauthorized');
     }
 
     const { event, data } = req.body;
-    if (event !== 'charge.success') return res.sendStatus(200);
+    if (event !== 'charge.completed') return res.sendStatus(200);
+    if (data?.status !== 'successful')  return res.sendStatus(200);
 
-    const { plan, userId } = data.metadata || {};
+    const { userId, plan } = data.meta || {};
     if (!userId || !plan || !PLANS[plan]) return res.sendStatus(200);
 
-    const cfg = PLANS[plan];
-    const now = Date.now();
-    let updateFields = {};
-
-    if (plan === 'boost') {
-      const expiry = new Date(now + cfg.durationMs);
-      updateFields = { isBoosted: true, boostExpiry: expiry, isVerified: true };
-    } else {
-      const expiry = new Date(now + cfg.durationMs);
-      updateFields = {
-        isSubscribed:       true,
-        subscriptionExpiry: expiry,
-        subscriptionPlan:   plan,
-        isVerified:         true,
-      };
-      if (plan === 'yearly') {
-        updateFields.isBoosted   = true;
-        updateFields.boostExpiry = new Date(now + cfg.freeBoostMs);
-      }
-    }
-
-    await User.findByIdAndUpdate(userId, updateFields);
-    console.log(`🪝 [Webhook] Activated plan="${plan}" for user=${userId}`);
+    await activatePlan(userId, plan);
+    console.log(`🪝 [Webhook] Activated plan="${plan}" for user=${userId} tx_ref="${data.tx_ref}"`);
     res.sendStatus(200);
   } catch (err) {
     console.error('❌ [Webhook] Error:', err.message);
@@ -265,49 +246,23 @@ exports.paystackWebhook = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/payment/subscribe  (kept for backward-compat, now calls verify flow)
-// Activates a monthly or yearly subscription.
-// Body: { plan: 'monthly' | 'yearly' }
+// POST /api/payment/subscribe  (kept for internal/admin use)
 // ─────────────────────────────────────────────────────────────────────────────
 exports.subscribe = async (req, res) => {
   try {
     const { plan = 'monthly' } = req.body;
-
     if (!PLANS[plan] || plan === 'boost') {
-      return res.status(400).json({ success: false, message: 'Invalid plan. Use "monthly" or "yearly".' });
+      return res.status(400).json({ success: false, message: 'Invalid plan.' });
     }
-
-    const cfg     = PLANS[plan];
-    const now     = Date.now();
-    const expiry  = new Date(now + cfg.durationMs);
-
-    const updateFields = {
-      isSubscribed:       true,
-      subscriptionExpiry: expiry,
-      subscriptionPlan:   plan,
-      isVerified:         true,   // all subscribers get the verified badge
-    };
-
-    // Yearly plan grants 1 week free boost
-    if (plan === 'yearly') {
-      updateFields.isBoosted   = true;
-      updateFields.boostExpiry = new Date(now + cfg.freeBoostMs);
-    }
-
-    const user = await User.findByIdAndUpdate(req.user._id, updateFields, { new: true })
-      .select('-password -otp -otpExpires -resetPasswordToken -resetPasswordExpires');
-
-    console.log(`✅ [Payment] ${req.user._id} subscribed (${plan}) until ${expiry.toISOString()}`);
-
+    const user = await activatePlan(req.user._id, plan);
+    console.log(`✅ [Payment] ${req.user._id} subscribed (${plan}) until ${user.subscriptionExpiry}`);
     res.json({
       success: true,
-      message: plan === 'yearly'
-        ? `Yearly subscription activated! You also get 1 week of free profile boosting.`
-        : `Monthly subscription activated!`,
+      message: plan === 'yearly' ? 'Yearly subscription activated! You also get 1 week of free profile boosting.' : 'Monthly subscription activated!',
       plan,
-      amount: cfg.amount,
-      subscriptionExpiry: expiry,
-      boostExpiry: updateFields.boostExpiry || null,
+      amount:             PLANS[plan].amount,
+      subscriptionExpiry: user.subscriptionExpiry,
+      boostExpiry:        user.boostExpiry || null,
       user,
     });
   } catch (err) {
@@ -317,28 +272,17 @@ exports.subscribe = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/payment/boost
-// Boosts the user's profile for 7 days (₦3,000).
-// TODO: Verify Paystack/Flutterwave payment before applying.
+// POST /api/payment/boost  (kept for internal/admin use)
 // ─────────────────────────────────────────────────────────────────────────────
 exports.boostProfile = async (req, res) => {
   try {
-    const cfg    = PLANS.boost;
-    const expiry = new Date(Date.now() + cfg.durationMs);
-
-    const user = await User.findByIdAndUpdate(
-      req.user._id,
-      { isBoosted: true, boostExpiry: expiry, isVerified: true },
-      { new: true }
-    ).select('-password -otp -otpExpires -resetPasswordToken -resetPasswordExpires');
-
-    console.log(`⚡ [Payment] ${req.user._id} boosted until ${expiry.toISOString()}`);
-
+    const user = await activatePlan(req.user._id, 'boost');
+    console.log(`⚡ [Payment] ${req.user._id} boosted until ${user.boostExpiry}`);
     res.json({
-      success: true,
-      message: 'Profile boosted for 7 days! You now appear at the top.',
-      amount:  cfg.amount,
-      boostExpiry: expiry,
+      success:     true,
+      message:     'Profile boosted for 7 days! You now appear at the top.',
+      amount:      PLANS.boost.amount,
+      boostExpiry: user.boostExpiry,
       user,
     });
   } catch (err) {
@@ -349,12 +293,10 @@ exports.boostProfile = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/payment/top-profiles
-// Returns currently boosted profiles.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getTopProfiles = async (req, res) => {
   try {
-    const now = new Date();
-
+    const now   = new Date();
     const users = await User.find({
       isBoosted:       true,
       boostExpiry:     { $gt: now },
@@ -367,7 +309,6 @@ exports.getTopProfiles = async (req, res) => {
       .sort({ boostExpiry: -1 })
       .limit(20)
       .lean();
-
     res.json({ success: true, users });
   } catch (err) {
     console.error('❌ [Payment] TopProfiles error:', err.message);
@@ -377,11 +318,9 @@ exports.getTopProfiles = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/payment/status
-// Returns subscription & boost status after running expiry cleanup.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getPaymentStatus = async (req, res) => {
   try {
-    // Auto-expire stale records
     await expireIfNeeded(req.user._id);
 
     const user = await User.findById(req.user._id)
@@ -390,22 +329,21 @@ exports.getPaymentStatus = async (req, res) => {
     const isSubscribed = !!(user.isSubscribed && stillActive(user.subscriptionExpiry));
     const isBoosted    = !!(user.isBoosted    && stillActive(user.boostExpiry));
 
-    // Days remaining helpers
     const daysUntil = (date) => {
       if (!date) return null;
       const diff = new Date(date) - new Date();
-      return diff > 0 ? Math.ceil(diff / (1000 * 60 * 60 * 24)) : 0;
+      return diff > 0 ? Math.ceil(diff / 86400000) : 0;
     };
 
     res.json({
-      success:            true,
+      success:              true,
       isSubscribed,
-      subscriptionPlan:   user.subscriptionPlan || null,
-      subscriptionExpiry: user.subscriptionExpiry,
+      subscriptionPlan:     user.subscriptionPlan || null,
+      subscriptionExpiry:   user.subscriptionExpiry,
       subscriptionDaysLeft: daysUntil(user.subscriptionExpiry),
       isBoosted,
-      boostExpiry:        user.boostExpiry,
-      boostDaysLeft:      daysUntil(user.boostExpiry),
+      boostExpiry:          user.boostExpiry,
+      boostDaysLeft:        daysUntil(user.boostExpiry),
     });
   } catch (err) {
     console.error('❌ [Payment] Status error:', err.message);
@@ -414,22 +352,18 @@ exports.getPaymentStatus = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/payment/check-expiry  (called from cron / app startup)
-// Bulk-expires stale subscriptions and sends pre-expiry push notifications
-// to users whose subscription expires within 3 days.
+// POST /api/payment/run-expiry
 // ─────────────────────────────────────────────────────────────────────────────
 exports.runExpiryCheck = async (req, res) => {
   try {
-    const now         = new Date();
-    const in3Days     = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
+    const now     = new Date();
+    const in3Days = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
 
-    // 1. Expire overdue subscriptions
     const expiredSubs = await User.updateMany(
       { isSubscribed: true, subscriptionExpiry: { $lte: now } },
       { $set: { isSubscribed: false } }
     );
 
-    // 2. Expire overdue boosts (also revoke verified badge unless still subscribed)
     const expiredBoosts = await User.find({
       isBoosted: true, boostExpiry: { $lte: now },
     }).select('_id isSubscribed subscriptionExpiry');
@@ -437,12 +371,11 @@ exports.runExpiryCheck = async (req, res) => {
     for (const u of expiredBoosts) {
       const keepVerified = u.isSubscribed && stillActive(u.subscriptionExpiry);
       await User.findByIdAndUpdate(u._id, {
-        isBoosted:  false,
+        isBoosted: false,
         ...(keepVerified ? {} : { isVerified: false }),
       });
     }
 
-    // 3. Notify users whose subscription expires in <= 3 days
     const soonExpiring = await User.find({
       isSubscribed:       true,
       subscriptionExpiry: { $gt: now, $lte: in3Days },
@@ -451,7 +384,7 @@ exports.runExpiryCheck = async (req, res) => {
 
     let notified = 0;
     for (const u of soonExpiring) {
-      const daysLeft = Math.ceil((new Date(u.subscriptionExpiry) - now) / (1000 * 60 * 60 * 24));
+      const daysLeft = Math.ceil((new Date(u.subscriptionExpiry) - now) / 86400000);
       await sendPushNotification(
         u.pushToken,
         '⚠️ Subscription Expiring Soon',
@@ -462,18 +395,11 @@ exports.runExpiryCheck = async (req, res) => {
     }
 
     console.log(`⏰ [Expiry] Expired subs: ${expiredSubs.modifiedCount} | Expired boosts: ${expiredBoosts.length} | Notified: ${notified}`);
-
-    res.json({
-      success:       true,
-      expiredSubs:   expiredSubs.modifiedCount,
-      expiredBoosts: expiredBoosts.length,
-      notified,
-    });
+    res.json({ success: true, expiredSubs: expiredSubs.modifiedCount, expiredBoosts: expiredBoosts.length, notified });
   } catch (err) {
     console.error('❌ [Expiry] runExpiryCheck error:', err.message);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
 
-// Export plan info so routes can expose it to the client
 exports.PLANS = PLANS;
