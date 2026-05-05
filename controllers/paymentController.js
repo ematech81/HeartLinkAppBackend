@@ -179,11 +179,11 @@ exports.verifyPayment = async (req, res) => {
         isSubscribed:       true,
         subscriptionExpiry: expiry,
         subscriptionPlan:   plan,
+        isVerified:         true,   // all subscribers get the verified badge
       };
       if (plan === 'yearly') {
         updateFields.isBoosted   = true;
         updateFields.boostExpiry = new Date(now + cfg.freeBoostMs);
-        updateFields.isVerified  = true;
       }
     }
 
@@ -247,11 +247,11 @@ exports.paystackWebhook = async (req, res) => {
         isSubscribed:       true,
         subscriptionExpiry: expiry,
         subscriptionPlan:   plan,
+        isVerified:         true,
       };
       if (plan === 'yearly') {
         updateFields.isBoosted   = true;
         updateFields.boostExpiry = new Date(now + cfg.freeBoostMs);
-        updateFields.isVerified  = true;
       }
     }
 
@@ -285,13 +285,13 @@ exports.subscribe = async (req, res) => {
       isSubscribed:       true,
       subscriptionExpiry: expiry,
       subscriptionPlan:   plan,
+      isVerified:         true,   // all subscribers get the verified badge
     };
 
     // Yearly plan grants 1 week free boost
     if (plan === 'yearly') {
       updateFields.isBoosted   = true;
       updateFields.boostExpiry = new Date(now + cfg.freeBoostMs);
-      updateFields.isVerified  = true;
     }
 
     const user = await User.findByIdAndUpdate(req.user._id, updateFields, { new: true })
