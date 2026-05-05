@@ -148,19 +148,26 @@ app.get('/health', (req, res) =>
 );
 
 // ── Routes ────────────────────────────────────────────────────────────────────
-const authRoutes    = require('./routes/authRoutes');
-const userRoutes    = require('./routes/userRoutes');
-const matchRoutes   = require('./routes/matchRoutes');
-const messageRoutes = require('./routes/messageRoutes');
-const uploadRoutes  = require('./routes/uploadRoutes');
-const paymentRoutes = require('./routes/paymentRoutes');
+const authRoutes      = require('./routes/authRoutes');
+const userRoutes      = require('./routes/userRoutes');
+const matchRoutes     = require('./routes/matchRoutes');
+const messageRoutes   = require('./routes/messageRoutes');
+const uploadRoutes    = require('./routes/uploadRoutes');
+const paymentRoutes   = require('./routes/paymentRoutes');
+const communityRoutes = require('./routes/communityRoutes');
 
-app.use('/api/auth',     authRoutes);
-app.use('/api/users',    userRoutes);
-app.use('/api/matches',  matchRoutes);
-app.use('/api/messages', messageRoutes);
-app.use('/api/upload',   uploadRoutes);
-app.use('/api/payment',  paymentRoutes);
+app.use('/api/auth',      authRoutes);
+app.use('/api/users',     userRoutes);
+app.use('/api/matches',   matchRoutes);
+app.use('/api/messages',  messageRoutes);
+app.use('/api/upload',    uploadRoutes);
+app.use('/api/payment',   paymentRoutes);
+app.use('/api/community', communityRoutes);
+
+// Cleanup expired community posts every hour
+const { cleanupExpiredPosts } = require('./controllers/communityController');
+setInterval(cleanupExpiredPosts, 60 * 60 * 1000);
+cleanupExpiredPosts(); // run once on startup
 
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((req, res) => {

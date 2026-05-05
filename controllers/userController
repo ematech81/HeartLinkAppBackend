@@ -55,9 +55,7 @@ exports.searchUsers = async (req, res) => {
  
     // ── Tab filter ────────────────────────────────────────────────────────────
     if (tab === 'top') {
-      // Top Profiles: only currently-boosted users, sorted by boostExpiry
-      filter.isBoosted   = true;
-      filter.boostExpiry = { $gt: new Date() };
+      // Top Profiles: boosted users appear first; no hard filter so the tab is never empty
     } else if (tab === 'global') {
       // Global: users from different countries
       if (req.user.country) {
@@ -141,7 +139,7 @@ exports.searchUsers = async (req, res) => {
       total = await User.countDocuments(filter);
       users = await User.find(filter)
         .select(SELECT_FIELDS)
-        .sort(tab === 'top' ? { boostExpiry: -1 } : {})
+        .sort(tab === 'top' ? { isBoosted: -1, boostExpiry: -1, createdAt: -1 } : {})
         .skip(skip)
         .limit(Number(limit))
         .lean();

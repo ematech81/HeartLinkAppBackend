@@ -86,9 +86,16 @@ exports.initializePayment = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid plan.' });
     }
 
+    if (!PAYSTACK_SECRET) {
+      console.error('❌ [Paystack] PAYSTACK_SECRET_KEY is not set in .env');
+      return res.status(500).json({ success: false, message: 'Payment service not configured.' });
+    }
+
     const cfg    = PLANS[plan];
     const user   = await User.findById(req.user._id).select('email name');
     const amount = toKobo(cfg.amount);
+
+    console.log(`💳 [Paystack] Initializing plan="${plan}" amount=${amount} for user=${req.user._id}`);
 
     const { data } = await axios.post(
       'https://api.paystack.co/transaction/initialize',
@@ -118,8 +125,10 @@ exports.initializePayment = async (req, res) => {
       plan,
     });
   } catch (err) {
-    console.error('❌ [Paystack] Initialize error:', err.response?.data || err.message);
-    res.status(500).json({ success: false, message: 'Could not start payment.' });
+    const detail = err.response?.data || err.message;
+    console.error('❌ [Paystack] Initialize error:', JSON.stringify(detail));
+    const msg = err.response?.data?.message || 'Could not start payment.';
+    res.status(500).json({ success: false, message: msg });
   }
 };
 
