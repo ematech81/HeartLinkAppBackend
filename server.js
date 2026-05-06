@@ -155,6 +155,7 @@ const messageRoutes   = require('./routes/messageRoutes');
 const uploadRoutes    = require('./routes/uploadRoutes');
 const paymentRoutes   = require('./routes/paymentRoutes');
 const communityRoutes = require('./routes/communityRoutes');
+const adminRoutes     = require('./routes/adminRoutes');
 
 app.use('/api/auth',      authRoutes);
 app.use('/api/users',     userRoutes);
@@ -163,6 +164,7 @@ app.use('/api/messages',  messageRoutes);
 app.use('/api/upload',    uploadRoutes);
 app.use('/api/payment',   paymentRoutes);
 app.use('/api/community', communityRoutes);
+app.use('/api/admin',     adminRoutes);
 
 // Cleanup expired community posts every hour
 const { cleanupExpiredPosts } = require('./controllers/communityController');
