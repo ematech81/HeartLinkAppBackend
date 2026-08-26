@@ -1,13 +1,14 @@
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const User = require('../models/User');
-const { generateOtp, sendOtp } = require('../utils/SendOTP'); // actual Twilio SMS-sending lives here
-const { sendPasswordResetEmail, sendEmail } = require('../utils/SendEmail');
+const { generateOtp, sendOtp } = require('../utils/SendOTP'); // actual BulkSMS sending lives here
+const { sendPasswordResetEmail, sendEmail } = require('../utils/SendEmail'); // actual Brevo sending lives here
+const { otpExpiryDate } = require('../utils/otp'); // shared expiry policy (OTP_EXPIRES_MINUTES) for both SMS OTP and the email reset code below
 const axios = require('axios');
 const { validateMinAge } = require('../utils/age');
 // NOTE: this file previously also imported `twilio` directly and
 // `{ OAuth2Client }` from google-auth-library — both unused (the actual
-// Twilio client lives in utils/SendOTP.js; googleAuth below verifies via
+// SMS client lives in utils/SendOTP.js; googleAuth below verifies via
 // Google's userinfo HTTP endpoint rather than OAuth2Client.verifyIdToken,
 // which is a valid approach but never used that import). Removed as dead
 // code rather than leaving unused imports around.
@@ -232,10 +233,12 @@ exports.forgotPassword = async (req, res) => {
       });
     }
  
-    // 6-digit code — easy for mobile users to type from email
-    const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
+    // Alphanumeric code — same format/expiry policy as the phone OTP (see
+    // utils/otp.js). Was a 6-digit numeric code with a 1-hour expiry;
+    // unified to match the SMS OTP convention (alphanumeric, OTP_EXPIRES_MINUTES).
+    const resetCode = generateOtp();
     user.resetPasswordToken   = crypto.createHash('sha256').update(resetCode).digest('hex');
-    user.resetPasswordExpires = Date.now() + 60 * 60 * 1000; // 1 hour
+    user.resetPasswordExpires = otpExpiryDate();
     await user.save({ validateBeforeSave: false });
 
     if (process.env.NODE_ENV !== 'production') {
@@ -297,7 +300,7 @@ exports.resetPassword = async (req, res) => {
  
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/auth/send-otp
-// Send a 6-digit OTP to the given phone number via Twilio SMS.
+// Send a 6-character alphanumeric OTP to the given phone number via BulkSMS.
 // The user must already have an account with that phone number.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.sendOtp = async (req, res) => {
@@ -317,7 +320,7 @@ exports.sendOtp = async (req, res) => {
     }
 
     const otp        = generateOtp();
-    const otpExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+    const otpExpires = otpExpiryDate(); // OTP_EXPIRES_MINUTES (default 10)
 
     user.otp        = otp;
     user.otpExpires = otpExpires;
