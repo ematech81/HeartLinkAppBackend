@@ -2,7 +2,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const User = require('../models/User');
 const { generateOtp, sendOtp } = require('../utils/SendOTP'); // actual BulkSMS sending lives here
-const { sendPasswordResetEmail, sendEmail } = require('../utils/SendEmail'); // actual Brevo sending lives here
+const { sendPasswordResetEmail, sendEmail, sendVerificationEmail } = require('../utils/SendEmail'); // actual Brevo sending lives here
 const { otpExpiryDate } = require('../utils/otp'); // shared expiry policy (OTP_EXPIRES_MINUTES) for both SMS OTP and the email reset code below
 const axios = require('axios');
 const { validateMinAge } = require('../utils/age');
@@ -130,12 +130,50 @@ exports.register = async (req, res) => {
  
     const user = await User.create(userData);
     console.log('✅ [Register] User created:', user._id);
- 
-    // 5. Send welcome email (non-blocking)
-    if (email) sendEmail(email, name).catch(() => {});
- 
+
+    // 5. Email/password accounts must verify their email before they can log
+    // in — Google accounts are pre-verified by Google, and phone-only
+    // accounts have nothing to email. This account is NOT usable yet: no
+    // token is issued here — only verifyEmailOtp (below) issues one, after
+    // the code is confirmed.
+    if (email) {
+      const otp = generateOtp();
+      user.emailOtp        = otp;
+      user.emailOtpExpires = otpExpiryDate();
+      await user.save({ validateBeforeSave: false });
+
+      try {
+        await sendVerificationEmail(email, otp, name);
+      } catch (emailErr) {
+        // The account already exists at this point — do NOT report this as
+        // "registration failed". Retrying registration would just hit
+        // "already registered" with no way forward. Tell the truth instead:
+        // account created, verification email didn't go out, resend is
+        // available. (This mirrors exactly the confusing gap a network
+        // hiccup between client and server can otherwise cause — the
+        // account silently exists while the client thinks it doesn't.)
+        console.error('❌ [Register] Verification email failed to send:', emailErr.message);
+        return res.status(201).json({
+          success: true,
+          requiresEmailVerification: true,
+          email: user.email,
+          emailSendFailed: true,
+          message: 'Account created, but we could not send the verification email. Tap "Resend Code" to try again.',
+        });
+      }
+
+      console.log(`✅ [Register] Verification email sent, awaiting confirmation: ${user._id}`);
+      return res.status(201).json({
+        success: true,
+        requiresEmailVerification: true,
+        email: user.email,
+        message: 'Account created. Check your email for a verification code to activate your account.',
+      });
+    }
+
+    // Phone-only registration — nothing to verify by email, issue the token now.
     sendTokenResponse(user, 201, res);
- 
+
   } catch (error) {
     console.error('❌ [Register] Error:', error.message);
     console.error(error.stack);
@@ -187,10 +225,21 @@ exports.login = async (req, res) => {
         message: 'Your account has been suspended. Please contact support.',
       });
     }
- 
+
+    // Email/password accounts must have verified their email — Google
+    // accounts are pre-verified, phone-only accounts have no email to gate.
+    if (user.authProvider === 'local' && user.email && !user.isEmailVerified) {
+      return res.status(403).json({
+        success: false,
+        requiresEmailVerification: true,
+        email: user.email,
+        message: 'Please verify your email before logging in.',
+      });
+    }
+
     user.lastSeen = Date.now();
     await user.save({ validateBeforeSave: false });
- 
+
     console.log('✅ [Login] Success:', user._id);
     sendTokenResponse(user, 200, res);
  
@@ -360,16 +409,112 @@ exports.verifyOtp = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid or expired OTP.' });
     }
 
-    // Clear OTP after successful verification
+    // Clear OTP after successful verification (it's consumed either way,
+    // regardless of what happens next)
     user.otp        = undefined;
     user.otpExpires = undefined;
     await user.save({ validateBeforeSave: false });
+
+    // This is a second, independent login path (passwordless, phone OTP) —
+    // without this same check, a user with an email/password account and an
+    // unverified email could just switch to the phone tab and bypass the
+    // verification gate in login() entirely.
+    if (user.authProvider === 'local' && user.email && !user.isEmailVerified) {
+      return res.status(403).json({
+        success: false,
+        requiresEmailVerification: true,
+        email: user.email,
+        message: 'Please verify your email before logging in.',
+      });
+    }
 
     console.log(`✅ [OTP] Verified for ${phone}`);
     sendTokenResponse(user, 200, res);
   } catch (err) {
     console.error('❌ [OTP] verifyOtp error:', err.message);
     res.status(500).json({ success: false, message: 'OTP verification failed.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/auth/verify-email-otp
+// Verify the email OTP sent at registration. For email/password accounts,
+// this is the ONLY place the JWT is issued — /register deliberately
+// withholds it until this succeeds.
+// Body: { email, otp }
+// ─────────────────────────────────────────────────────────────────────────────
+exports.verifyEmailOtp = async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    if (!email || !otp) {
+      return res.status(400).json({ success: false, message: 'Email and verification code are required.' });
+    }
+
+    const user = await User.findOne({ email: email.toLowerCase() }).select('+emailOtp +emailOtpExpires');
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'No account found with this email.' });
+    }
+
+    // Idempotent — a duplicate/late verify request for an already-verified
+    // account just logs them in rather than erroring.
+    if (user.isEmailVerified) {
+      return sendTokenResponse(user, 200, res);
+    }
+
+    if (!user.isEmailOtpValid(otp)) {
+      return res.status(400).json({ success: false, message: 'Invalid or expired verification code.' });
+    }
+
+    user.isEmailVerified = true;
+    user.emailOtp        = undefined;
+    user.emailOtpExpires = undefined;
+    await user.save({ validateBeforeSave: false });
+
+    console.log(`✅ [VerifyEmail] Verified for ${email}`);
+
+    // Welcome email now that the account is confirmed real — non-blocking,
+    // a welcome-email hiccup must never block actual account activation.
+    sendEmail(user.email, user.name).catch(() => {});
+
+    sendTokenResponse(user, 200, res);
+  } catch (err) {
+    console.error('❌ [VerifyEmail] Error:', err.message);
+    res.status(500).json({ success: false, message: 'Verification failed.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/auth/resend-email-otp
+// Body: { email }
+// ─────────────────────────────────────────────────────────────────────────────
+exports.resendEmailOtp = async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'Email is required.' });
+    }
+
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'No account found with this email.' });
+    }
+
+    if (user.isEmailVerified) {
+      return res.status(400).json({ success: false, message: 'This email is already verified. Please log in.' });
+    }
+
+    const otp = generateOtp();
+    user.emailOtp        = otp;
+    user.emailOtpExpires = otpExpiryDate();
+    await user.save({ validateBeforeSave: false });
+
+    await sendVerificationEmail(user.email, otp, user.name);
+
+    console.log(`✅ [ResendEmailOtp] Sent to ${email}`);
+    res.status(200).json({ success: true, message: 'Verification code resent. Check your email.' });
+  } catch (err) {
+    console.error('❌ [ResendEmailOtp] Error:', err.message);
+    res.status(500).json({ success: false, message: err.message || 'Failed to resend verification code.' });
   }
 };
 

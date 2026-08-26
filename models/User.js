@@ -106,9 +106,18 @@ const userSchema = new mongoose.Schema(
     // durable proof-of-consent record the audit flagged as missing.
     agreedToTermsAt: { type: Date, default: null },
 
-    // ── OTP ────────────────────────────────────────────────────────────────
+    // ── OTP (phone login/verification) ─────────────────────────────────────
     otp:        { type: String,  select: false },
     otpExpires: { type: Date,    select: false },
+
+    // ── Email verification OTP ──────────────────────────────────────────────
+    // Deliberately separate from otp/otpExpires above — most registrations
+    // collect both an email and a phone, so a single shared pair of fields
+    // would let a pending phone-OTP request silently clobber a pending
+    // email-verification code (or vice versa) if both were ever in flight
+    // at once.
+    emailOtp:        { type: String, select: false },
+    emailOtpExpires: { type: Date,   select: false },
 
     // ── Password reset ─────────────────────────────────────────────────────
     resetPasswordToken:   { type: String, select: false },
@@ -192,6 +201,10 @@ userSchema.methods.comparePassword = async function (candidate) {
 
 userSchema.methods.isOtpValid = function (otp) {
   return this.otp === otp && this.otpExpires > Date.now();
+};
+
+userSchema.methods.isEmailOtpValid = function (otp) {
+  return this.emailOtp === otp && this.emailOtpExpires > Date.now();
 };
 
 

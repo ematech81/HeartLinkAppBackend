@@ -76,6 +76,49 @@ const sendPasswordResetEmail = async (to, resetCode, name) => {
 };
 
 /**
+ * Send the email-verification code required before a local (email/password)
+ * account can log in. `otp` is the same alphanumeric format as SMS OTP (see
+ * utils/otp.js). Throws on failure — unlike the welcome email, a failed send
+ * here matters: the caller (AuthController.register) needs to know so it
+ * can surface it rather than silently leaving the user with no way to get
+ * their code.
+ */
+const sendVerificationEmail = async (to, otp, name) => {
+  if (!isConfigured()) {
+    console.log(`⚠️  [Email] Brevo not configured — skipping verification email to ${to}`);
+    console.log(`🔑 [Email] Verification code for ${to}: ${otp}`);
+    return;
+  }
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px">
+      <h1 style="color:#FF4D6D;text-align:center">♥ HeartLink</h1>
+      <div style="background:#fff;border-radius:12px;padding:30px;border:1px solid #F3F4F6">
+        <h2 style="color:#1F2937">Verify Your Email</h2>
+        <p style="color:#6B7280">Hi <strong>${name}</strong>,</p>
+        <p style="color:#6B7280">Enter the code below in the HeartLink app to verify your email and activate your account.</p>
+        <div style="text-align:center;margin:30px 0">
+          <div style="display:inline-block;background:#FFF1F3;border:2px solid #FF4D6D;border-radius:12px;padding:20px 40px">
+            <p style="margin:0;font-size:13px;color:#6B7280;letter-spacing:1px;text-transform:uppercase">Verification Code</p>
+            <p style="margin:8px 0 0;font-size:40px;font-weight:900;color:#FF4D6D;letter-spacing:8px">${otp}</p>
+          </div>
+        </div>
+        <p style="color:#9CA3AF;font-size:14px;text-align:center">Expires in <strong>${process.env.OTP_EXPIRES_MINUTES || 10} minutes</strong>. Do not share this code.</p>
+      </div>
+    </div>
+  `;
+  const text = `Hi ${name},\n\nYour HeartLink verification code is: ${otp}\n\nEnter this code in the app to verify your email. It expires in ${process.env.OTP_EXPIRES_MINUTES || 10} minutes.\n\nHeartLink Team`;
+
+  try {
+    await sendViaBrevo({ to, toName: name, subject: 'Verify Your HeartLink Email', html, text });
+    console.log(`✅ [Email] Verification email sent to ${to}`);
+  } catch (error) {
+    console.error(`❌ [Email] Verification email failed for ${to}:`, error.response?.data?.message || error.message);
+    throw new Error('Failed to send verification email. Please try again.');
+  }
+};
+
+/**
  * Send a welcome email after registration.
  */
 const sendEmail = async (to, name) => {
@@ -103,4 +146,4 @@ const sendEmail = async (to, name) => {
   }
 };
 
-module.exports = { sendPasswordResetEmail, sendEmail };
+module.exports = { sendPasswordResetEmail, sendEmail, sendVerificationEmail };
