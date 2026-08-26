@@ -15,33 +15,61 @@ exports.getConversations = async (req, res) => {
     const matches = await Match.find({
       users: { $in: [userId] },
       isActive: true,
-    }).populate('users', 'name profilePicture photos isOnline lastSeen isVerified city country');
+    })
+      .populate('users', 'name profilePicture photos isOnline lastSeen isVerified city country')
+      .lean();
 
-    // For each match, get the last message + unread count
-    const conversations = await Promise.all(
-      matches.map(async (match) => {
-        const otherUser = match.users.find(
-          (u) => u._id.toString() !== userId.toString()
-        );
+    if (matches.length === 0) {
+      return res.status(200).json({ success: true, conversations: [] });
+    }
 
-        // Last message between these two users
-        const lastMessage = await Message.findOne({
+    const otherUserByMatchId = new Map();
+    const otherUserIds = [];
+    for (const match of matches) {
+      const otherUser = match.users.find((u) => u._id.toString() !== userId.toString());
+      if (!otherUser) continue; // shouldn't happen now that deletion anonymizes rather than removing the User doc, but stay defensive
+      otherUserByMatchId.set(match._id.toString(), otherUser);
+      otherUserIds.push(otherUser._id);
+    }
+
+    // Previously this ran 2 queries PER match (last message + unread count)
+    // — for a user with N matches that's 2N+1 round-trips on a screen that
+    // loads every time MessagesScreen opens. One aggregation now computes
+    // both, grouped by conversation partner, in a single round-trip.
+    const perPartner = await Message.aggregate([
+      {
+        $match: {
+          isDeleted: false,
           $or: [
-            { sender: userId,     receiver: otherUser._id },
-            { sender: otherUser._id, receiver: userId },
+            { sender: userId, receiver: { $in: otherUserIds } },
+            { receiver: userId, sender: { $in: otherUserIds } },
           ],
-          isDeleted: false,
-        })
-          .sort({ createdAt: -1 })
-          .lean();
+        },
+      },
+      { $addFields: { otherParty: { $cond: [{ $eq: ['$sender', userId] }, '$receiver', '$sender'] } } },
+      { $sort: { createdAt: -1 } }, // must precede $group so $first below is the most recent
+      {
+        $group: {
+          _id:         '$otherParty',
+          lastMessage: { $first: '$$ROOT' },
+          unreadCount: {
+            $sum: {
+              $cond: [{ $and: [{ $eq: ['$receiver', userId] }, { $eq: ['$isRead', false] }] }, 1, 0],
+            },
+          },
+        },
+      },
+    ]);
+    const byOtherParty = new Map(perPartner.map((p) => [p._id.toString(), p]));
 
-        // Unread count — messages sent TO current user that are unread
-        const unreadCount = await Message.countDocuments({
-          sender:   otherUser._id,
-          receiver: userId,
-          isRead:   false,
-          isDeleted: false,
-        });
+    const conversations = matches
+      .map((match) => {
+        const otherUser = otherUserByMatchId.get(match._id.toString());
+        if (!otherUser) return null;
+
+        const agg         = byOtherParty.get(otherUser._id.toString());
+        const lastMessage = agg?.lastMessage;
+        const unreadCount = agg?.unreadCount || 0;
 
         return {
           matchId:   match._id,
@@ -59,7 +87,7 @@ exports.getConversations = async (req, res) => {
           isActive: unreadCount > 0,
         };
       })
-    );
+      .filter(Boolean);
 
     // Sort: conversations with messages first, then by recency
     conversations.sort((a, b) => {
@@ -89,8 +117,21 @@ exports.getMessages = async (req, res) => {
     const limit = parseInt(req.query.limit) || 30;
 
     // Subscribed users can view messages with anyone (Community direct-message feature)
-    const reqUser = await User.findById(currentUserId).select('isSubscribed subscriptionExpiry');
+    const [reqUser, otherUser] = await Promise.all([
+      User.findById(currentUserId).select('isSubscribed subscriptionExpiry blockedUsers'),
+      User.findById(otherUserId).select('blockedUsers'),
+    ]);
     const isSubscribed = reqUser?.isSubscribed && (!reqUser.subscriptionExpiry || reqUser.subscriptionExpiry > new Date());
+
+    // Block check runs regardless of subscription status — the "message
+    // anyone" premium perk must never let a subscriber read/send around a
+    // block in either direction.
+    const isBlocked =
+      (reqUser?.blockedUsers   || []).some((id) => id.toString() === otherUserId) ||
+      (otherUser?.blockedUsers || []).some((id) => id.toString() === currentUserId.toString());
+    if (isBlocked) {
+      return res.status(403).json({ success: false, message: 'Unable to load this conversation.' });
+    }
 
     const match = await Match.findOne({
       users:    { $all: [currentUserId, otherUserId] },
@@ -171,8 +212,17 @@ exports.sendMessage = async (req, res) => {
     }
 
     // Subscribed users can message anyone (Community direct-message is a paid feature)
-    const senderUser  = await User.findById(senderId).select('isSubscribed subscriptionExpiry');
+    const senderUser  = await User.findById(senderId).select('isSubscribed subscriptionExpiry blockedUsers');
     const isSubscribed = senderUser?.isSubscribed && (!senderUser.subscriptionExpiry || senderUser.subscriptionExpiry > new Date());
+
+    // Block check runs regardless of subscription status — see getMessages
+    // for why this can't be skipped for premium "message anyone" users.
+    const isBlocked =
+      (senderUser?.blockedUsers || []).some((id) => id.toString() === receiverId) ||
+      (receiver.blockedUsers    || []).some((id) => id.toString() === senderId.toString());
+    if (isBlocked) {
+      return res.status(403).json({ success: false, message: 'Unable to send message to this user.' });
+    }
 
     const match = await Match.findOne({
       users:    { $all: [senderId, receiverId] },
@@ -197,12 +247,12 @@ exports.sendMessage = async (req, res) => {
 
     console.log(`✅ [SendMessage] ${senderId} → ${receiverId}: "${content.substring(0, 30)}..."`);
 
-    // ── Push notification to receiver if they have a token ────────────────
-    if (receiver.pushToken) {
+    // ── Push notification to all of the receiver's registered devices ─────
+    if (receiver.pushTokens?.length) {
       const sender = await User.findById(senderId).select('name');
       const preview = content.length > 60 ? content.substring(0, 60) + '…' : content;
       sendPushNotification(
-        receiver.pushToken,
+        receiver.pushTokens,
         sender.name.split(' ')[0],
         preview,
         { type: 'message', senderId: senderId.toString() }

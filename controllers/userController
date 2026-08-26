@@ -1,9 +1,58 @@
 const User   = require('../models/User');
 const { Like, Match } = require('../models/Match');
+const Report = require('../models/Report');
+const Post   = require('../models/Post');
+const { validateMinAge } = require('../utils/age');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared: anonymize a user's account. Used by both self-service deletion
+// (DELETE /api/users/me, below) and admin deletion (adminController.deleteUser).
+//
+// Design: keep the User document (as a scrubbed stub) rather than a hard
+// delete, so Messages/Matches/Likes/Reports that reference this id via
+// populate() keep resolving instead of leaving dangling references that
+// crash other users' screens (getConversations, in particular, already had
+// a confirmed crash path here). Posts are hard-deleted — nothing else
+// references those, and there's no "other party's history" reason to keep
+// them. email/phone are $unset (not set to null) because both carry a
+// sparse unique index — setting them to null instead would collide with
+// every other null-valued document under that index.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.anonymizeUser = async (userId) => {
+  await Post.deleteMany({ author: userId });
+
+  await User.findByIdAndUpdate(userId, {
+    $set: {
+      name:           'Deleted User',
+      bio:            '',
+      profession:     null,
+      religion:       null,
+      city:           null,
+      country:        null,
+      interests:      [],
+      profilePicture: null,
+      photos:         [],
+      introVideo:     null,
+      pushToken:      null,
+      pushTokens:     [],
+      googleId:       null,
+      blockedUsers:   [],
+      location:       { type: 'Point', coordinates: [0, 0] },
+      isActive:        false,
+      isProfileHidden: true,
+      isDeleted:       true,
+      deletedAt:       new Date(),
+    },
+    $unset: { email: 1, phone: 1 },
+  });
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PUT /api/users/push-token
-// Save or update the user's Expo push token
+// Register the current device's Expo push token — adds to pushTokens
+// (multi-device: a phone and a tablet, or a reinstall, can both stay
+// registered) rather than overwriting a single field. $addToSet avoids
+// storing the same token twice if a device re-registers.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.savePushToken = async (req, res) => {
   try {
@@ -11,11 +60,32 @@ exports.savePushToken = async (req, res) => {
     if (!pushToken) {
       return res.status(400).json({ success: false, message: 'Push token is required.' });
     }
-    await User.findByIdAndUpdate(req.user._id, { pushToken });
-    console.log(`📲 [PushToken] Saved for ${req.user._id}`);
+    await User.findByIdAndUpdate(req.user._id, { $addToSet: { pushTokens: pushToken } });
+    console.log(`📲 [PushToken] Registered for ${req.user._id}`);
     res.status(200).json({ success: true });
   } catch (error) {
     console.error('❌ [PushToken] Error:', error.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /api/users/push-token
+// Deregister this device's token — call on logout, so a shared/reset device
+// stops receiving a now-logged-out user's notifications (and doesn't risk
+// showing them to whoever logs in next on the same device).
+// ─────────────────────────────────────────────────────────────────────────────
+exports.removePushToken = async (req, res) => {
+  try {
+    const { pushToken } = req.body;
+    if (!pushToken) {
+      return res.status(400).json({ success: false, message: 'Push token is required.' });
+    }
+    await User.findByIdAndUpdate(req.user._id, { $pull: { pushTokens: pushToken } });
+    console.log(`📲 [PushToken] Deregistered for ${req.user._id}`);
+    res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('❌ [RemovePushToken] Error:', error.message);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
@@ -42,12 +112,18 @@ exports.searchUsers = async (req, res) => {
     } = req.query;
  
     console.log('🔍 [Search] Params:', req.query);
- 
-    const alreadyLiked = await Like.find({ sender: req.user._id }).distinct('receiver');
- 
+
+    const alreadyLiked   = await Like.find({ sender: req.user._id }).distinct('receiver');
+
+    // Exclude both directions of blocking: people I blocked, and people who
+    // blocked me — neither should be able to find the other in Discover.
+    const iBlocked       = (req.user.blockedUsers || []).map((id) => id.toString());
+    const blockedMe      = await User.find({ blockedUsers: req.user._id }).distinct('_id');
+    const excludedIds    = [...new Set([...alreadyLiked, ...iBlocked, ...blockedMe].map(String))];
+
     // ── Base filter ───────────────────────────────────────────────────────────
     const filter = {
-      _id:             { $ne: req.user._id, $nin: alreadyLiked },
+      _id:             { $ne: req.user._id, $nin: excludedIds },
       isActive:        true,
       isBanned:        false,
       isProfileHidden: false,
@@ -187,6 +263,40 @@ exports.getUserById = async (req, res) => {
   }
 };
 
+// findByIdAndUpdate below runs with runValidators:false — a previous fix
+// attempt for an undiagnosed "silent failure" (see the comment on that
+// option). Re-enabling schema-wide validators risks reintroducing whatever
+// that was, with no live DB available here to verify against. This instead
+// validates just the fields that carry real constraints (enums, ranges),
+// reading the constraints straight off the User schema so they can never
+// drift from it.
+const ENUM_FIELDS = ['gender', 'relationshipType', 'lookingFor', 'education', 'drink', 'smoke'];
+
+function validateProfileUpdates(updates) {
+  for (const field of ENUM_FIELDS) {
+    if (updates[field] === undefined) continue;
+    const allowedValues = User.schema.path(field)?.enumValues;
+    if (allowedValues?.length && !allowedValues.includes(updates[field])) {
+      return `Invalid value for ${field}: must be one of ${allowedValues.join(', ')}.`;
+    }
+  }
+  if (updates.height !== undefined) {
+    const h = Number(updates.height);
+    if (isNaN(h) || h < 100 || h > 250) return 'Height must be between 100 and 250 cm.';
+  }
+  if (updates.numberOfKids !== undefined) {
+    const n = Number(updates.numberOfKids);
+    if (isNaN(n) || n < 0) return 'Number of kids cannot be negative.';
+  }
+  if (updates.bio !== undefined && updates.bio.length > 500) {
+    return 'Bio must be 500 characters or fewer.';
+  }
+  if (updates.photos !== undefined && Array.isArray(updates.photos) && updates.photos.length > 6) {
+    return 'Maximum 6 photos allowed.';
+  }
+  return null;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PUT /api/users/profile
 // Update own profile
@@ -207,6 +317,28 @@ exports.updateProfile = async (req, res) => {
       Object.entries(req.body).filter(([k]) => allowed.includes(k))
     );
 
+    const validationError = validateProfileUpdates(updates);
+    if (validationError) {
+      return res.status(400).json({ success: false, message: validationError });
+    }
+
+    // dateOfBirth reaches this endpoint via the Google-onboarding profile
+    // completion step (see RegistrationScreen googleMode path) — same
+    // server-side 18+ enforcement as regular /auth/register, otherwise a
+    // Google sign-up could set any dateOfBirth with no age check at all.
+    if (updates.dateOfBirth) {
+      const ageError = validateMinAge(updates.dateOfBirth);
+      if (ageError) return res.status(400).json({ success: false, message: ageError });
+    }
+
+    // Consent — Google-onboarding users go through the same agreement modal
+    // client-side but never hit /auth/register, so this is where their
+    // consent gets recorded. `agreedToTerms` is a trigger, not a stored
+    // field: only the server-stamped timestamp is persisted.
+    if (req.body.agreedToTerms === true) {
+      updates.agreedToTermsAt = new Date();
+    }
+
     console.log('📝 [UpdateProfile] Saving:', updates); // ← add this log
 
     const user = await User.findByIdAndUpdate(
@@ -226,7 +358,9 @@ exports.updateProfile = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/users/:id/block
-// Block a user
+// Block a user — persists the block (was previously a no-op that only
+// unmatched/unliked, so the blocked user could immediately reappear and
+// re-match). Also unmatches + clears likes both ways, same as before.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.blockUser = async (req, res) => {
   try {
@@ -235,10 +369,19 @@ exports.blockUser = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Cannot block yourself.' });
     }
 
+    const target = await User.findById(targetId).select('_id');
+    if (!target) {
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+
+    // Persist the block
+    await User.findByIdAndUpdate(req.user._id, { $addToSet: { blockedUsers: targetId } });
+
     // Remove any existing match between them
     await Match.deleteOne({ users: { $all: [req.user._id, targetId] } });
 
-    // Remove likes between them
+    // Remove likes between them (prevents a stale like from re-surfacing
+    // this person in the other's "who liked you" list)
     await Like.deleteMany({
       $or: [
         { sender: req.user._id, receiver: targetId },
@@ -254,23 +397,114 @@ exports.blockUser = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/users/:id/report
-// Report a user
+// DELETE /api/users/:id/block
+// Unblock a user
 // ─────────────────────────────────────────────────────────────────────────────
+exports.unblockUser = async (req, res) => {
+  try {
+    await User.findByIdAndUpdate(req.user._id, { $pull: { blockedUsers: req.params.id } });
+    res.status(200).json({ success: true, message: 'User unblocked.' });
+  } catch (error) {
+    console.error('❌ [UnblockUser] Error:', error.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/users/blocked
+// List users the current user has blocked
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getBlockedUsers = async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id)
+      .select('blockedUsers')
+      .populate('blockedUsers', 'name profilePicture city country');
+    res.status(200).json({ success: true, blockedUsers: user?.blockedUsers || [] });
+  } catch (error) {
+    console.error('❌ [GetBlockedUsers] Error:', error.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/users/:id/report
+// Report a user — persists to the Report model so it shows up in the admin
+// moderation queue (previously this only console.logged and discarded the
+// report, so nothing a user reported was ever actually reviewable).
+// ─────────────────────────────────────────────────────────────────────────────
+const VALID_REPORT_REASONS = ['inappropriate_content', 'harassment', 'fake_profile', 'spam', 'other'];
+
 exports.reportUser = async (req, res) => {
   try {
     const { reason, description } = req.body;
-    if (!reason) {
-      return res.status(400).json({ success: false, message: 'Reason is required.' });
+    const targetId = req.params.id;
+
+    if (!reason || !VALID_REPORT_REASONS.includes(reason)) {
+      return res.status(400).json({
+        success: false,
+        message: `Reason is required and must be one of: ${VALID_REPORT_REASONS.join(', ')}.`,
+      });
+    }
+    if (targetId === req.user._id.toString()) {
+      return res.status(400).json({ success: false, message: 'Cannot report yourself.' });
     }
 
-    // In a full implementation, save to a Report model
-    console.log(`🚨 [Report] User ${req.user._id} reported ${req.params.id}: ${reason}`);
+    const target = await User.findById(targetId).select('_id');
+    if (!target) {
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
 
-    res.status(200).json({ success: true, message: 'Report submitted. Our team will review it.' });
+    const report = await Report.create({
+      reporter:    req.user._id,
+      reported:    targetId,
+      type:        'user',
+      reason,
+      description: description || undefined,
+    });
+
+    console.log(`🚨 [Report] User ${req.user._id} reported ${targetId} (${reason}) — report ${report._id}`);
+
+    res.status(201).json({ success: true, message: 'Report submitted. Our team will review it.' });
   } catch (error) {
     console.error('❌ [ReportUser] Error:', error.message);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
-}; 
- 
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /api/users/me
+// Self-service account deletion (GDPR/NDPR right to erasure). Previously
+// only an admin could delete a user at all.
+//
+// Re-confirmation: local (password) accounts must re-enter their password.
+// Google-only accounts have no password to check (see the schema fix making
+// `password` conditionally required) — for those, holding a currently-valid
+// JWT is treated as sufficient proof of a live session, and `confirm: true`
+// is required either way as a guard against an accidental/stray call.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.deleteMe = async (req, res) => {
+  try {
+    const { password, confirm } = req.body;
+    if (confirm !== true) {
+      return res.status(400).json({
+        success: false,
+        message: 'Account deletion must be explicitly confirmed.',
+      });
+    }
+
+    if (req.user.authProvider === 'local') {
+      const userWithPassword = await User.findById(req.user._id).select('+password');
+      if (!password || !(await userWithPassword.comparePassword(password))) {
+        return res.status(401).json({ success: false, message: 'Incorrect password.' });
+      }
+    }
+
+    await exports.anonymizeUser(req.user._id);
+    console.log(`🗑️ [DeleteMe] User ${req.user._id} deleted their own account.`);
+
+    res.status(200).json({ success: true, message: 'Your account has been deleted.' });
+  } catch (error) {
+    console.error('❌ [DeleteMe] Error:', error.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};

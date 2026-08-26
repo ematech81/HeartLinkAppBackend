@@ -43,6 +43,18 @@ const protect = async (req, res, next) => {
       });
     }
 
+    // 4b. Check if deleted — a stale JWT (issued before deletion, still
+    // technically valid for up to JWT_EXPIRES_IN) must not keep working
+    // against an anonymized account. `isActive` below would also catch this
+    // (anonymizeUser sets both), but this gives a truthful error message
+    // instead of the generic "inactive" one.
+    if (user.isDeleted) {
+      return res.status(401).json({
+        success: false,
+        message: 'This account has been deleted.',
+      });
+    }
+
     // 5. Check if account is active
     if (!user.isActive) {
       return res.status(403).json({

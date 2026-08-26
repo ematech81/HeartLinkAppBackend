@@ -1,20 +1,16 @@
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const User = require('../models/User');
-const { generateOtp, sendOtp } = require('../utils/SendOTP');
+const { generateOtp, sendOtp } = require('../utils/SendOTP'); // actual Twilio SMS-sending lives here
 const { sendPasswordResetEmail, sendEmail } = require('../utils/SendEmail');
-const twilio = require('twilio');
-const { OAuth2Client } = require('google-auth-library');
 const axios = require('axios');
-
-
-
-// // // Initialize Twilio client
-// const twilioClient = twilio(
-//   process.env.TWILIO_ACCOUNT_SID,
-//   process.env.TWILIO_AUTH_TOKEN
-// );
- 
+const { validateMinAge } = require('../utils/age');
+// NOTE: this file previously also imported `twilio` directly and
+// `{ OAuth2Client }` from google-auth-library — both unused (the actual
+// Twilio client lives in utils/SendOTP.js; googleAuth below verifies via
+// Google's userinfo HTTP endpoint rather than OAuth2Client.verifyIdToken,
+// which is a valid approach but never used that import). Removed as dead
+// code rather than leaving unused imports around.
 
 // ── Sign JWT ──────────────────────────────────────────────────────────────────
 const signToken = (id) =>
@@ -51,8 +47,9 @@ exports.register = async (req, res) => {
       lookingFor, education, drink, smoke, religion,
       profession, bio, height, interests,
       numberOfKids, kidsAges,
+      agreedToTerms,
     } = req.body;
- 
+
     // 1. Required fields check
     if (!name || !password || !gender || !dateOfBirth || !country || !city || !relationshipType) {
       const missing = ['name','password','gender','dateOfBirth','country','city','relationshipType']
@@ -63,7 +60,28 @@ exports.register = async (req, res) => {
         message: `Missing required fields: ${missing.join(', ')}`,
       });
     }
- 
+
+    // 1b. Age check — the app's registration form already blocks under-18s
+    // client-side (and requires an explicit 18+ consent checkbox), but the
+    // API itself must not trust that; anyone calling it directly bypassed
+    // both checks entirely before this.
+    const ageError = validateMinAge(dateOfBirth);
+    if (ageError) {
+      console.log('❌ [Register] Age check failed:', ageError);
+      return res.status(400).json({ success: false, message: ageError });
+    }
+
+    // 1c. Consent — must match the app's Terms/Privacy/guidelines agreement
+    // modal. Recorded server-side (agreedToTermsAt) as the durable
+    // proof-of-consent record; a client-supplied timestamp is never trusted,
+    // only the boolean flag as a trigger to stamp "now".
+    if (agreedToTerms !== true) {
+      return res.status(400).json({
+        success: false,
+        message: 'You must agree to the Terms & Conditions to create an account.',
+      });
+    }
+
     // 2. Must provide email or phone
     if (!email && !phone) {
       return res.status(400).json({
@@ -71,7 +89,7 @@ exports.register = async (req, res) => {
         message: 'Please provide an email address or phone number.',
       });
     }
- 
+
     // 3. Check existing user
     const query = [];
     if (email) query.push({ email: email.toLowerCase() });
@@ -91,6 +109,7 @@ exports.register = async (req, res) => {
     const userData = {
       name, password,
       gender, dateOfBirth, country, city, relationshipType,
+      agreedToTermsAt: new Date(), // stamped server-side, never client-supplied
       ...(email      && { email: email.toLowerCase() }),
       ...(phone      && { phone }),
       ...(lookingFor && { lookingFor }),
@@ -193,338 +212,6 @@ exports.getMe = async (req, res) => {
   }
 };
  
-
-
-
-
-// ============================================
-// SEND OTP (REFACTORED WITH BYPASS)
-// ============================================
- 
-// /**
-//  * Send OTP via SMS or Email
-//  * In development: Logs OTP to console instead of sending
-//  * @route POST /api/auth/send-otp
-//  * @access Public
-//  */
-// exports.sendOTP = async (req, res) => {
-//   try {
-//     const { phone, email } = req.body;
- 
-//     // Validate input - must provide phone OR email
-//     if (!phone && !email) {
-//       return res.status(400).json({
-//         success: false,
-//         message: 'Phone number or email is required',
-//       });
-//     }
- 
-//     console.log('📱 [SendOTP] Request:', { phone, email });
- 
-//     // Determine delivery method
-//     const deliveryMethod = phone ? 'sms' : 'email';
-//     const recipient = phone || email;
- 
-//     // Check if user exists
-//     let user = await User.findOne(
-//       phone ? { phoneNumber: phone } : { email: email }
-//     );
- 
-//     if (!user) {
-//       // Create new user if doesn't exist
-//       user = await User.create({
-//         phoneNumber: phone,
-//         email: email,
-//         registrationMethod: deliveryMethod,
-//       });
-//       console.log('✅ [SendOTP] New user created:', user._id);
-//     }
- 
-//     // Generate 6-digit OTP
-//     const otpCode = crypto.randomInt(100000, 999999).toString();
- 
-//     // Delete any existing OTPs for this user
-//     await OTP.deleteMany({ userId: user._id });
- 
-//     // Save OTP to database
-//     const otp = await OTP.create({
-//       userId: user._id,
-//       code: otpCode,
-//       phoneNumber: phone,
-//       email: email,
-//       expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 minutes
-//     });
- 
-//     console.log('🔐 [SendOTP] OTP generated:', otpCode);
- 
-//     // ============================================
-//     // DELIVERY LOGIC
-//     // ============================================
- 
-//     const isDevelopment = process.env.NODE_ENV !== 'production';
-//     const forceConsoleOTP = process.env.FORCE_CONSOLE_OTP === 'true';
- 
-//     if (deliveryMethod === 'sms') {
-//       // ============================================
-//       // SMS DELIVERY
-//       // ============================================
- 
-//       if (isDevelopment || forceConsoleOTP) {
-//         // 🔧 DEVELOPMENT MODE: Log OTP to console
-//         console.log('');
-//         console.log('╔════════════════════════════════════╗');
-//         console.log('║     🔐 OTP CODE (DEVELOPMENT)     ║');
-//         console.log('╠════════════════════════════════════╣');
-//         console.log(`║  Phone: ${phone.padEnd(23)} ║`);
-//         console.log(`║  Code:  ${otpCode.padEnd(23)} ║`);
-//         console.log(`║  Expires: 10 minutes              ║`);
-//         console.log('╚════════════════════════════════════╝');
-//         console.log('');
- 
-//         return res.json({
-//           success: true,
-//           message: 'OTP sent successfully (check backend console)',
-//           developmentMode: true,
-//           otp: isDevelopment ? otpCode : undefined, // Include OTP in response for dev
-//         });
-//       }
- 
-//       // 🚀 PRODUCTION MODE: Send via Twilio
-//       try {
-//         await twilioClient.messages.create({
-//           body: `Your PayFlex verification code is: ${otpCode}. Valid for 10 minutes.`,
-//           from: process.env.TWILIO_PHONE_NUMBER,
-//           to: phone,
-//         });
- 
-//         console.log('✅ [SendOTP] SMS sent successfully via Twilio');
- 
-//         return res.json({
-//           success: true,
-//           message: 'OTP sent successfully to your phone',
-//         });
- 
-//       } catch (twilioError) {
-//         console.error('❌ [Twilio Error]:', twilioError.message);
- 
-//         // Fallback: Send via email if SMS fails
-//         if (user.email) {
-//           console.log('🔄 [SendOTP] SMS failed, attempting email fallback...');
- 
-//           try {
-//             await sendEmail({
-//               to: user.email,
-//               subject: 'PayFlex - Your Verification Code',
-//               html: `
-//                 <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-//                   <h2 style="color: #2196F3;">PayFlex Verification Code</h2>
-//                   <p>Your verification code is:</p>
-//                   <div style="background: #f5f5f5; padding: 20px; text-align: center; font-size: 32px; font-weight: bold; letter-spacing: 5px; margin: 20px 0;">
-//                     ${otpCode}
-//                   </div>
-//                   <p style="color: #666;">This code will expire in 10 minutes.</p>
-//                   <p style="color: #666; font-size: 12px;">If you didn't request this code, please ignore this email.</p>
-//                 </div>
-//               `,
-//             });
- 
-//             console.log('✅ [SendOTP] Email fallback sent successfully');
- 
-//             return res.json({
-//               success: true,
-//               message: 'SMS delivery failed. OTP sent to your email instead.',
-//               fallbackMethod: 'email',
-//             });
- 
-//           } catch (emailError) {
-//             console.error('❌ [Email Fallback Error]:', emailError.message);
-//             throw new Error('Failed to send OTP via SMS or email');
-//           }
-//         }
- 
-//         // No email fallback available
-//         throw twilioError;
-//       }
- 
-//     } else {
-//       // ============================================
-//       // EMAIL DELIVERY
-//       // ============================================
- 
-//       if (isDevelopment || forceConsoleOTP) {
-//         // 🔧 DEVELOPMENT MODE: Log OTP to console
-//         console.log('');
-//         console.log('╔════════════════════════════════════╗');
-//         console.log('║     🔐 OTP CODE (DEVELOPMENT)     ║');
-//         console.log('╠════════════════════════════════════╣');
-//         console.log(`║  Email: ${email.padEnd(22)} ║`);
-//         console.log(`║  Code:  ${otpCode.padEnd(23)} ║`);
-//         console.log(`║  Expires: 10 minutes              ║`);
-//         console.log('╚════════════════════════════════════╝');
-//         console.log('');
- 
-//         return res.json({
-//           success: true,
-//           message: 'OTP sent successfully (check backend console)',
-//           developmentMode: true,
-//           otp: isDevelopment ? otpCode : undefined,
-//         });
-//       }
- 
-//       // 🚀 PRODUCTION MODE: Send via email
-//       try {
-//         await sendEmail({
-//           to: email,
-//           subject: 'PayFlex - Your Verification Code',
-//           html: `
-//             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-//               <h2 style="color: #2196F3;">PayFlex Verification Code</h2>
-//               <p>Your verification code is:</p>
-//               <div style="background: #f5f5f5; padding: 20px; text-align: center; font-size: 32px; font-weight: bold; letter-spacing: 5px; margin: 20px 0;">
-//                 ${otpCode}
-//               </div>
-//               <p style="color: #666;">This code will expire in 10 minutes.</p>
-//               <p style="color: #666; font-size: 12px;">If you didn't request this code, please ignore this email.</p>
-//             </div>
-//           `,
-//         });
- 
-//         console.log('✅ [SendOTP] Email sent successfully');
- 
-//         return res.json({
-//           success: true,
-//           message: 'OTP sent successfully to your email',
-//         });
- 
-//       } catch (emailError) {
-//         console.error('❌ [Email Error]:', emailError.message);
-//         throw emailError;
-//       }
-//     }
- 
-//   } catch (error) {
-//     console.error('❌ [SendOTP] Error:', error.message);
-    
-//     res.status(500).json({
-//       success: false,
-//       message: 'Failed to send OTP. Please try again.',
-//       error: process.env.NODE_ENV === 'development' ? error.message : undefined,
-//     });
-//   }
-// };
- 
-// // ============================================
-// // VERIFY OTP (UPDATED)
-// // ============================================
- 
-// /**
-//  * Verify OTP and login/register user
-//  * @route POST /api/auth/verify-otp
-//  * @access Public
-//  */
-// exports.verifyOTP = async (req, res) => {
-//   try {
-//     const { phone, email, code } = req.body;
- 
-//     // Validate input
-//     if ((!phone && !email) || !code) {
-//       return res.status(400).json({
-//         success: false,
-//         message: 'Phone/email and OTP code are required',
-//       });
-//     }
- 
-//     console.log('🔐 [VerifyOTP] Request:', { phone, email, code });
- 
-//     // Find user
-//     const user = await User.findOne(
-//       phone ? { phoneNumber: phone } : { email: email }
-//     );
- 
-//     if (!user) {
-//       return res.status(404).json({
-//         success: false,
-//         message: 'User not found',
-//       });
-//     }
- 
-//     // Find OTP
-//     const otp = await OTP.findOne({
-//       userId: user._id,
-//       code: code,
-//     });
- 
-//     if (!otp) {
-//       return res.status(401).json({
-//         success: false,
-//         message: 'Invalid OTP code',
-//       });
-//     }
- 
-//     // Check if OTP is expired
-//     if (otp.expiresAt < new Date()) {
-//       await OTP.deleteOne({ _id: otp._id });
-//       return res.status(401).json({
-//         success: false,
-//         message: 'OTP has expired. Please request a new one.',
-//       });
-//     }
- 
-//     // Check if OTP was already used
-//     if (otp.isUsed) {
-//       return res.status(401).json({
-//         success: false,
-//         message: 'OTP has already been used',
-//       });
-//     }
- 
-//     // Mark OTP as used
-//     otp.isUsed = true;
-//     await otp.save();
- 
-//     // Update user verification status
-//     if (phone) {
-//       user.isPhoneVerified = true;
-//     }
-//     if (email) {
-//       user.isEmailVerified = true;
-//     }
-//     await user.save();
- 
-//     // Generate JWT token
-//     const token = user.generateAuthToken();
- 
-//     console.log('✅ [VerifyOTP] Success for user:', user._id);
- 
-//     res.json({
-//       success: true,
-//       message: 'OTP verified successfully',
-//       token,
-//       user: {
-//         id: user._id,
-//         phoneNumber: user.phoneNumber,
-//         email: user.email,
-//         firstName: user.firstName,
-//         lastName: user.lastName,
-//         isPhoneVerified: user.isPhoneVerified,
-//         isEmailVerified: user.isEmailVerified,
-//       },
-//     });
- 
-//     // Delete used OTP
-//     await OTP.deleteOne({ _id: otp._id });
- 
-//   } catch (error) {
-//     console.error('❌ [VerifyOTP] Error:', error.message);
-//     res.status(500).json({
-//       success: false,
-//       message: 'Failed to verify OTP',
-//       error: process.env.NODE_ENV === 'development' ? error.message : undefined,
-//     });
-//   }
-// };
-
- 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/auth/forgot-password
 // ─────────────────────────────────────────────────────────────────────────────
@@ -607,555 +294,7 @@ exports.resetPassword = async (req, res) => {
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
-
-
-
-
-
-// // controllers/authController.js - COMPLETE WORKING VERSION
-
-// const crypto = require('crypto');
-// const bcrypt = require('bcryptjs');
-// const jwt = require('jsonwebtoken');
-// const User = require('../models/User');
-// // const OTP = require('../models/OTP'); // Make sure this model exists!
-// const sendEmail = require('../utils/sendEmail');
-
-// // Twilio setup (optional - only if you want SMS in production)
-// let twilioClient = null;
-// try {
-//   if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-//     const twilio = require('twilio');
-//     twilioClient = twilio(
-//       process.env.TWILIO_ACCOUNT_SID,
-//       process.env.TWILIO_AUTH_TOKEN
-//     );
-//   }
-// } catch (error) {
-//   console.warn('⚠️ Twilio not configured, SMS disabled');
-// }
-
-// // ============================================
-// // SEND OTP
-// // ============================================
-
-// exports.sendOTP = async (req, res) => {
-//   try {
-//     const { phone, email } = req.body;
-
-//     // Validate input - must provide phone OR email
-//     if (!phone && !email) {
-//       return res.status(400).json({
-//         success: false,
-//         message: 'Phone number or email is required',
-//       });
-//     }
-
-//     console.log('📱 [SendOTP] Request:', { phone, email });
-
-//     // Determine delivery method
-//     const deliveryMethod = phone ? 'sms' : 'email';
-//     const recipient = phone || email;
-
-//     // Check if user exists
-//     let user = await User.findOne(
-//       phone ? { phoneNumber: phone } : { email: email }
-//     );
-
-//     if (!user) {
-//       // Create new user if doesn't exist
-//       user = await User.create({
-//         phoneNumber: phone,
-//         email: email,
-//         registrationMethod: deliveryMethod,
-//       });
-//       console.log('✅ [SendOTP] New user created:', user._id);
-//     }
-
-//     // Generate 6-digit OTP
-//     const otpCode = crypto.randomInt(100000, 999999).toString();
-
-//     // Delete any existing OTPs for this user
-//     await OTP.deleteMany({ userId: user._id });
-
-//     // Save OTP to database
-//     const otp = await OTP.create({
-//       userId: user._id,
-//       code: otpCode,
-//       phoneNumber: phone,
-//       email: email,
-//       expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 minutes
-//     });
-
-//     console.log('🔐 [SendOTP] OTP generated:', otpCode);
-
-//     // ============================================
-//     // DELIVERY LOGIC
-//     // ============================================
-
-//     const isDevelopment = process.env.NODE_ENV !== 'production';
-//     const forceConsoleOTP = process.env.FORCE_CONSOLE_OTP === 'true';
-
-//     if (deliveryMethod === 'sms') {
-//       // ============================================
-//       // SMS DELIVERY
-//       // ============================================
-
-//       if (isDevelopment || forceConsoleOTP) {
-//         // 🔧 DEVELOPMENT MODE: Log OTP to console
-//         console.log('');
-//         console.log('╔════════════════════════════════════╗');
-//         console.log('║     🔐 OTP CODE (DEVELOPMENT)     ║');
-//         console.log('╠════════════════════════════════════╣');
-//         console.log(`║  Phone: ${phone.padEnd(23)} ║`);
-//         console.log(`║  Code:  ${otpCode.padEnd(23)} ║`);
-//         console.log(`║  Expires: 10 minutes              ║`);
-//         console.log('╚════════════════════════════════════╝');
-//         console.log('');
-
-//         return res.json({
-//           success: true,
-//           message: 'OTP sent successfully (check backend console)',
-//           developmentMode: true,
-//           otp: isDevelopment ? otpCode : undefined, // Include OTP in response for dev
-//         });
-//       }
-
-//       // 🚀 PRODUCTION MODE: Send via Twilio
-//       if (twilioClient) {
-//         try {
-//           await twilioClient.messages.create({
-//             body: `Your PayFlex verification code is: ${otpCode}. Valid for 10 minutes.`,
-//             from: process.env.TWILIO_PHONE_NUMBER,
-//             to: phone,
-//           });
-
-//           console.log('✅ [SendOTP] SMS sent successfully via Twilio');
-
-//           return res.json({
-//             success: true,
-//             message: 'OTP sent successfully to your phone',
-//           });
-
-//         } catch (twilioError) {
-//           console.error('❌ [Twilio Error]:', twilioError.message);
-
-//           // Fallback: Send via email if SMS fails
-//           if (user.email) {
-//             console.log('🔄 [SendOTP] SMS failed, attempting email fallback...');
-
-//             try {
-//               await sendEmail({
-//                 to: user.email,
-//                 subject: 'PayFlex - Your Verification Code',
-//                 html: `
-//                   <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-//                     <h2 style="color: #2196F3;">PayFlex Verification Code</h2>
-//                     <p>Your verification code is:</p>
-//                     <div style="background: #f5f5f5; padding: 20px; text-align: center; font-size: 32px; font-weight: bold; letter-spacing: 5px; margin: 20px 0;">
-//                       ${otpCode}
-//                     </div>
-//                     <p style="color: #666;">This code will expire in 10 minutes.</p>
-//                     <p style="color: #666; font-size: 12px;">If you didn't request this code, please ignore this email.</p>
-//                   </div>
-//                 `,
-//               });
-
-//               console.log('✅ [SendOTP] Email fallback sent successfully');
-
-//               return res.json({
-//                 success: true,
-//                 message: 'SMS delivery failed. OTP sent to your email instead.',
-//                 fallbackMethod: 'email',
-//               });
-
-//             } catch (emailError) {
-//               console.error('❌ [Email Fallback Error]:', emailError.message);
-//               throw new Error('Failed to send OTP via SMS or email');
-//             }
-//           }
-
-//           // No email fallback available
-//           throw twilioError;
-//         }
-//       } else {
-//         // No Twilio configured - log to console
-//         console.log('⚠️ Twilio not configured, logging OTP to console');
-//         console.log('');
-//         console.log('╔════════════════════════════════════╗');
-//         console.log('║     🔐 OTP CODE (NO SMS)          ║');
-//         console.log('╠════════════════════════════════════╣');
-//         console.log(`║  Phone: ${phone.padEnd(23)} ║`);
-//         console.log(`║  Code:  ${otpCode.padEnd(23)} ║`);
-//         console.log('╚════════════════════════════════════╝');
-//         console.log('');
-
-//         return res.json({
-//           success: true,
-//           message: 'OTP sent successfully (check backend console)',
-//           developmentMode: true,
-//           otp: otpCode,
-//         });
-//       }
-
-//     } else {
-//       // ============================================
-//       // EMAIL DELIVERY
-//       // ============================================
-
-//       if (isDevelopment || forceConsoleOTP) {
-//         // 🔧 DEVELOPMENT MODE: Log OTP to console
-//         console.log('');
-//         console.log('╔════════════════════════════════════╗');
-//         console.log('║     🔐 OTP CODE (DEVELOPMENT)     ║');
-//         console.log('╠════════════════════════════════════╣');
-//         console.log(`║  Email: ${email.padEnd(22)} ║`);
-//         console.log(`║  Code:  ${otpCode.padEnd(23)} ║`);
-//         console.log(`║  Expires: 10 minutes              ║`);
-//         console.log('╚════════════════════════════════════╝');
-//         console.log('');
-
-//         return res.json({
-//           success: true,
-//           message: 'OTP sent successfully (check backend console)',
-//           developmentMode: true,
-//           otp: isDevelopment ? otpCode : undefined,
-//         });
-//       }
-
-//       // 🚀 PRODUCTION MODE: Send via email
-//       try {
-//         await sendEmail({
-//           to: email,
-//           subject: 'PayFlex - Your Verification Code',
-//           html: `
-//             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-//               <h2 style="color: #2196F3;">PayFlex Verification Code</h2>
-//               <p>Your verification code is:</p>
-//               <div style="background: #f5f5f5; padding: 20px; text-align: center; font-size: 32px; font-weight: bold; letter-spacing: 5px; margin: 20px 0;">
-//                 ${otpCode}
-//               </div>
-//               <p style="color: #666;">This code will expire in 10 minutes.</p>
-//               <p style="color: #666; font-size: 12px;">If you didn't request this code, please ignore this email.</p>
-//             </div>
-//           `,
-//         });
-
-//         console.log('✅ [SendOTP] Email sent successfully');
-
-//         return res.json({
-//           success: true,
-//           message: 'OTP sent successfully to your email',
-//         });
-
-//       } catch (emailError) {
-//         console.error('❌ [Email Error]:', emailError.message);
-//         throw emailError;
-//       }
-//     }
-
-//   } catch (error) {
-//     console.error('❌ [SendOTP] Error:', error.message);
-    
-//     res.status(500).json({
-//       success: false,
-//       message: 'Failed to send OTP. Please try again.',
-//       error: process.env.NODE_ENV === 'development' ? error.message : undefined,
-//     });
-//   }
-// };
-
-// // ============================================
-// // VERIFY OTP
-// // ============================================
-
-// exports.verifyOTP = async (req, res) => {
-//   try {
-//     const { phone, email, code } = req.body;
-
-//     // Validate input
-//     if ((!phone && !email) || !code) {
-//       return res.status(400).json({
-//         success: false,
-//         message: 'Phone/email and OTP code are required',
-//       });
-//     }
-
-//     console.log('🔐 [VerifyOTP] Request:', { phone, email, code });
-
-//     // Find user
-//     const user = await User.findOne(
-//       phone ? { phoneNumber: phone } : { email: email }
-//     );
-
-//     if (!user) {
-//       return res.status(404).json({
-//         success: false,
-//         message: 'User not found',
-//       });
-//     }
-
-//     // Find OTP
-//     const otp = await OTP.findOne({
-//       userId: user._id,
-//       code: code,
-//     });
-
-//     if (!otp) {
-//       return res.status(401).json({
-//         success: false,
-//         message: 'Invalid OTP code',
-//       });
-//     }
-
-//     // Check if OTP is expired
-//     if (otp.expiresAt < new Date()) {
-//       await OTP.deleteOne({ _id: otp._id });
-//       return res.status(401).json({
-//         success: false,
-//         message: 'OTP has expired. Please request a new one.',
-//       });
-//     }
-
-//     // Check if OTP was already used
-//     if (otp.isUsed) {
-//       return res.status(401).json({
-//         success: false,
-//         message: 'OTP has already been used',
-//       });
-//     }
-
-//     // Mark OTP as used
-//     otp.isUsed = true;
-//     await otp.save();
-
-//     // Update user verification status
-//     if (phone) {
-//       user.isPhoneVerified = true;
-//     }
-//     if (email) {
-//       user.isEmailVerified = true;
-//     }
-//     await user.save();
-
-//     // Generate JWT token
-//     const token = user.generateAuthToken();
-
-//     console.log('✅ [VerifyOTP] Success for user:', user._id);
-
-//     res.json({
-//       success: true,
-//       message: 'OTP verified successfully',
-//       token,
-//       user: {
-//         id: user._id,
-//         phoneNumber: user.phoneNumber,
-//         email: user.email,
-//         firstName: user.firstName,
-//         lastName: user.lastName,
-//         isPhoneVerified: user.isPhoneVerified,
-//         isEmailVerified: user.isEmailVerified,
-//       },
-//     });
-
-//     // Delete used OTP
-//     await OTP.deleteOne({ _id: otp._id });
-
-//   } catch (error) {
-//     console.error('❌ [VerifyOTP] Error:', error.message);
-//     res.status(500).json({
-//       success: false,
-//       message: 'Failed to verify OTP',
-//       error: process.env.NODE_ENV === 'development' ? error.message : undefined,
-//     });
-//   }
-// };
-
-// // ============================================
-// // EMAIL/PASSWORD REGISTER
-// // ============================================
-
-// exports.register = async (req, res) => {
-//   try {
-//     const { email, password, firstName, lastName, phoneNumber } = req.body;
-
-//     // Validate required fields
-//     if (!email || !password) {
-//       return res.status(400).json({
-//         success: false,
-//         message: 'Email and password are required',
-//       });
-//     }
-
-//     // Check if user exists
-//     const existingUser = await User.findOne({ email });
-//     if (existingUser) {
-//       return res.status(400).json({
-//         success: false,
-//         message: 'User already exists with this email',
-//       });
-//     }
-
-//     // Create user
-//     const user = await User.create({
-//       email,
-//       password, // Will be hashed by pre-save hook
-//       firstName,
-//       lastName,
-//       phoneNumber,
-//       isEmailVerified: false,
-//       registrationMethod: 'email',
-//     });
-
-//     // Generate token
-//     const token = user.generateAuthToken();
-
-//     res.status(201).json({
-//       success: true,
-//       message: 'Registration successful',
-//       token,
-//       user: {
-//         id: user._id,
-//         email: user.email,
-//         firstName: user.firstName,
-//         lastName: user.lastName,
-//         phoneNumber: user.phoneNumber,
-//       },
-//     });
-
-//   } catch (error) {
-//     console.error('❌ Register Error:', error.message);
-//     res.status(500).json({
-//       success: false,
-//       message: 'Registration failed',
-//       error: process.env.NODE_ENV === 'development' ? error.message : undefined,
-//     });
-//   }
-// };
-
-// // ============================================
-// // EMAIL/PASSWORD LOGIN
-// // ============================================
-
-// exports.login = async (req, res) => {
-//   try {
-//     const { email, password } = req.body;
-
-//     // Validate input
-//     if (!email || !password) {
-//       return res.status(400).json({
-//         success: false,
-//         message: 'Email and password are required',
-//       });
-//     }
-
-//     // Find user with password field
-//     const user = await User.findOne({ email }).select('+password');
-
-//     if (!user) {
-//       return res.status(401).json({
-//         success: false,
-//         message: 'Invalid email or password',
-//       });
-//     }
-
-//     // Check password
-//     const isPasswordValid = await user.comparePassword(password);
-
-//     if (!isPasswordValid) {
-//       return res.status(401).json({
-//         success: false,
-//         message: 'Invalid email or password',
-//       });
-//     }
-
-//     // Generate token
-//     const token = user.generateAuthToken();
-
-//     res.json({
-//       success: true,
-//       message: 'Login successful',
-//       token,
-//       user: {
-//         id: user._id,
-//         email: user.email,
-//         firstName: user.firstName,
-//         lastName: user.lastName,
-//         phoneNumber: user.phoneNumber,
-//         isEmailVerified: user.isEmailVerified,
-//         isPhoneVerified: user.isPhoneVerified,
-//       },
-//     });
-
-//   } catch (error) {
-//     console.error('❌ Login Error:', error.message);
-//     res.status(500).json({
-//       success: false,
-//       message: 'Login failed',
-//       error: process.env.NODE_ENV === 'development' ? error.message : undefined,
-//     });
-//   }
-// };
-
-// // ============================================
-// // GET CURRENT USER
-// // ============================================
-
-// exports.getMe = async (req, res) => {
-//   try {
-//     const user = await User.findById(req.user._id);
-
-//     res.json({
-//       success: true,
-//       user: {
-//         id: user._id,
-//         email: user.email,
-//         phoneNumber: user.phoneNumber,
-//         firstName: user.firstName,
-//         lastName: user.lastName,
-//         isEmailVerified: user.isEmailVerified,
-//         isPhoneVerified: user.isPhoneVerified,
-//         walletBalance: user.walletBalance,
-//       },
-//     });
-
-//   } catch (error) {
-//     console.error('❌ GetMe Error:', error.message);
-//     res.status(500).json({
-//       success: false,
-//       message: 'Failed to get user',
-//     });
-//   }
-// };
-
-// // ============================================
-// // LOGOUT
-// // ============================================
-
-// exports.logout = async (req, res) => {
-//   try {
-//     // In JWT-based auth, logout is handled client-side by removing the token
-//     res.json({
-//       success: true,
-//       message: 'Logged out successfully',
-//     });
-//   } catch (error) {
-//     res.status(500).json({
-//       success: false,
-//       message: 'Logout failed',
-//     });
-//   }
-// };
-
-// module.exports = {
-//   sendOTP: exports.sendOTP,
-//   verifyOTP: exports.verifyOTP,
-//   register: exports.register,
-//   login: exports.login,
-//   getMe: exports.getMe,
-//   logout: exports.logout,
-// };
-
+ 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/auth/send-otp
 // Send a 6-digit OTP to the given phone number via Twilio SMS.
@@ -1233,8 +372,10 @@ exports.verifyOtp = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/auth/google
-// Verify a Google ID token, then find-or-create the user.
-// Body: { idToken: string }
+// Verify a Google access token (via Google's userinfo endpoint — Google's
+// servers do the actual signature/validity check), then find-or-create the
+// user.
+// Body: { accessToken: string }
 // Returns: { token, user, isNewUser }
 // ─────────────────────────────────────────────────────────────────────────────
 exports.googleAuth = async (req, res) => {
@@ -1255,7 +396,17 @@ exports.googleAuth = async (req, res) => {
       return res.status(401).json({ success: false, message: 'Invalid Google access token.' });
     }
 
-    const { id: googleId, email, name, picture } = googleUser;
+    const { id: googleId, email, name, picture, verified_email: verifiedEmail } = googleUser;
+
+    if (!email) {
+      return res.status(401).json({ success: false, message: 'Google account has no email to sign in with.' });
+    }
+    // Google explicitly tells us when an email isn't verified — previously
+    // this was never checked, so isEmailVerified:true was set unconditionally
+    // below regardless of what Google actually reported.
+    if (verifiedEmail === false) {
+      return res.status(401).json({ success: false, message: 'Google email is not verified.' });
+    }
 
     // ── Find existing user by Google ID or email ──────────────────────────────
     let user = await User.findOne({ $or: [{ googleId }, { email: email?.toLowerCase() }] });

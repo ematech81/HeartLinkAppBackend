@@ -12,15 +12,16 @@ const {
   googleAuth,
 } = require('../controllers/AuthController');
 const { protect } = require('../middleware/authMiddleware');
+const { authLimiter, otpLimiter, passwordResetLimiter } = require('../middleware/rateLimiter');
 
 // ── Public routes ─────────────────────────────────────────────────────────────
-router.post('/register',        register);
-router.post('/login',           login);
-router.post('/google',          googleAuth);
-router.post('/send-otp',    sendOtp);
-router.post('/verify-otp',  verifyOtp);
-router.post('/forgot-password', forgotPassword);
-router.post('/reset-password',  resetPassword);
+router.post('/register',        authLimiter,         register);
+router.post('/login',           authLimiter,         login);
+router.post('/google',          authLimiter,         googleAuth);
+router.post('/send-otp',        otpLimiter,          sendOtp);
+router.post('/verify-otp',      otpLimiter,          verifyOtp);
+router.post('/forgot-password', passwordResetLimiter, forgotPassword);
+router.post('/reset-password',  passwordResetLimiter, resetPassword);
 
 // ── Protected routes ──────────────────────────────────────────────────────────
 router.get('/me', protect, getMe);

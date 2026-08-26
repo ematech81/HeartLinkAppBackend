@@ -22,6 +22,13 @@ exports.likeUser = async (req, res) => {
       return res.status(404).json({ success: false, message: 'User not found.' });
     }
 
+    // Blocking is one-directional in storage but blocks interaction both ways
+    const iBlockedThem = (req.user.blockedUsers || []).some((id) => id.toString() === receiverId);
+    const theyBlockedMe = (receiver.blockedUsers || []).some((id) => id.toString() === senderId.toString());
+    if (iBlockedThem || theyBlockedMe) {
+      return res.status(403).json({ success: false, message: 'You cannot interact with this user.' });
+    }
+
     // Upsert like (avoid duplicate)
     await Like.findOneAndUpdate(
       { sender: senderId, receiver: receiverId },
@@ -47,22 +54,22 @@ exports.likeUser = async (req, res) => {
         match = await match.populate('users', 'name profilePicture photos city country profession');
         console.log(`🎉 [Match] New match: ${senderId} ↔ ${receiverId}`);
 
-        // ── Notify both users of the new match ────────────────────────────
+        // ── Notify both users of the new match (all of each user's devices) ─
         const [userA, userB] = await Promise.all([
-          User.findById(senderId).select('name pushToken'),
-          User.findById(receiverId).select('name pushToken'),
+          User.findById(senderId).select('name pushTokens'),
+          User.findById(receiverId).select('name pushTokens'),
         ]);
-        if (userB?.pushToken) {
+        if (userB?.pushTokens?.length) {
           sendPushNotification(
-            userB.pushToken,
+            userB.pushTokens,
             "It's a Match! 💕",
             `You and ${userA.name.split(' ')[0]} have liked each other. Say hello!`,
             { type: 'match', matchId: match._id.toString() }
           );
         }
-        if (userA?.pushToken) {
+        if (userA?.pushTokens?.length) {
           sendPushNotification(
-            userA.pushToken,
+            userA.pushTokens,
             "It's a Match! 💕",
             `You and ${userB.name.split(' ')[0]} have liked each other. Say hello!`,
             { type: 'match', matchId: match._id.toString() }
@@ -120,26 +127,44 @@ exports.passUser = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getMatches = async (req, res) => {
   try {
-    const matches = await Match.find({
-      users:    { $in: [req.user._id] },
-      isActive: true,
-    })
-      .populate('users', 'name profilePicture photos city country profession isOnline lastSeen isVerified')
-      .sort({ matchedAt: -1 })
-      .lean();
+    // Previously unpaginated — a user with hundreds of matches got them all
+    // in one response. Defaults to a generous limit so existing callers
+    // (which don't pass page/limit yet) aren't surprised by a small page.
+    const page  = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit = Math.min(100, parseInt(req.query.limit) || 50);
+    const skip  = (page - 1) * limit;
+
+    const filter = { users: { $in: [req.user._id] }, isActive: true };
+
+    const [matches, total] = await Promise.all([
+      Match.find(filter)
+        .populate('users', 'name profilePicture photos city country profession isOnline lastSeen isVerified')
+        .sort({ matchedAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Match.countDocuments(filter),
+    ]);
 
     // Format: return the OTHER user's info alongside match id
     const formatted = matches
-  .map((match) => {
-    const otherUser = match.users.find(
-      (u) => u._id?.toString() !== req.user._id.toString()
-    );
-    return { matchId: match._id, matchedAt: match.matchedAt, user: otherUser };
-  })
-  .filter((m) => m.user != null); // ← remove matches with no user
+      .map((match) => {
+        const otherUser = match.users.find(
+          (u) => u._id?.toString() !== req.user._id.toString()
+        );
+        return { matchId: match._id, matchedAt: match.matchedAt, user: otherUser };
+      })
+      .filter((m) => m.user != null); // defensive — shouldn't trigger now that deletion anonymizes rather than removing the User doc
 
-    console.log(`✅ [GetMatches] Found ${formatted.length} matches for ${req.user._id}`);
-    res.status(200).json({ success: true, matches: formatted });
+    console.log(`✅ [GetMatches] Found ${formatted.length} matches for ${req.user._id} (page ${page})`);
+    res.status(200).json({
+      success: true,
+      matches: formatted,
+      page,
+      total,
+      totalPages: Math.ceil(total / limit),
+      hasMore: skip + matches.length < total,
+    });
   } catch (error) {
     console.error('❌ [GetMatches] Error:', error.message);
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -178,12 +203,31 @@ exports.unmatch = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getLikes = async (req, res) => {
   try {
-    const likes = await Like.find({ receiver: req.user._id, isPassed: { $ne: true } })
-      .populate('sender', 'name profilePicture city country profession isVerified')
-      .sort({ createdAt: -1 })
-      .lean();
+    const page  = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit = Math.min(100, parseInt(req.query.limit) || 50);
+    const skip  = (page - 1) * limit;
 
-    res.status(200).json({ success: true, likes, count: likes.length });
+    const filter = { receiver: req.user._id, isPassed: { $ne: true } };
+
+    const [likes, total] = await Promise.all([
+      Like.find(filter)
+        .populate('sender', 'name profilePicture city country profession isVerified')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Like.countDocuments(filter),
+    ]);
+
+    res.status(200).json({
+      success: true,
+      likes,
+      count: likes.length, // kept for backward compat — count of THIS page, not total
+      page,
+      total,
+      totalPages: Math.ceil(total / limit),
+      hasMore: skip + likes.length < total,
+    });
   } catch (error) {
     console.error('❌ [GetLikes] Error:', error.message);
     res.status(500).json({ success: false, message: 'Server error.' });

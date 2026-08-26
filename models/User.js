@@ -14,7 +14,17 @@ const userSchema = new mongoose.Schema(
       match: [/^[^\s@]+@[^\s@]+\.[^\s@]+$/, 'Enter a valid email'],
     },
     phone:    { type: String, unique: true, sparse: true, trim: true },
-    password: { type: String, required: true, minlength: 8, select: false },
+    // Only required for local (email/phone + password) accounts. This was
+    // unconditionally `required: true` before, which meant every first-time
+    // Google sign-up (googleAuth's User.create with no password field) threw
+    // a ValidationError and failed outright — Google sign-up was completely
+    // broken for new users until this fix (2026-08-24).
+    password: {
+      type: String,
+      required: [function () { return this.authProvider === 'local'; }, 'Password is required'],
+      minlength: 8,
+      select: false,
+    },
 
     // ── Step 2: Personal Info ──────────────────────────────────────────────
     gender: {
@@ -89,6 +99,13 @@ const userSchema = new mongoose.Schema(
     googleId:          { type: String, default: null },
     isProfileComplete: { type: Boolean, default: true }, // false for new Google sign-in users
 
+    // ── Consent ─────────────────────────────────────────────────────────────
+    // Server-stamped (never trust a client-supplied timestamp) the moment the
+    // user's "agreedToTerms: true" is accepted, either at registration or at
+    // Google-onboarding profile completion. Presence of a value here is the
+    // durable proof-of-consent record the audit flagged as missing.
+    agreedToTermsAt: { type: Date, default: null },
+
     // ── OTP ────────────────────────────────────────────────────────────────
     otp:        { type: String,  select: false },
     otpExpires: { type: Date,    select: false },
@@ -98,7 +115,15 @@ const userSchema = new mongoose.Schema(
     resetPasswordExpires: { type: Date,   select: false },
 
     // ── Push notifications ─────────────────────────────────────────────────
-    pushToken: { type: String, default: null },
+    // `pushToken` (singular) is deprecated — kept only so existing documents
+    // aren't touched by this migration; nothing reads or writes it anymore.
+    // `pushTokens` supports multiple simultaneous devices per account (e.g.
+    // a phone and a tablet, or reinstalling without the old token being
+    // evicted) — every active user re-registers on next app open (see
+    // registerForPushNotifications, called on every authenticated launch),
+    // so no manual data migration is needed for existing accounts.
+    pushToken:  { type: String, default: null }, // deprecated — do not use in new code
+    pushTokens: [{ type: String }],
 
     // ── Subscription ───────────────────────────────────────────────────────────
     isSubscribed:       { type: Boolean, default: false },
@@ -115,6 +140,25 @@ const userSchema = new mongoose.Schema(
     isProfileHidden: { type: Boolean, default: false },
     lastSeen:        { type: Date,    default: Date.now },
     role:            { type: String,  enum: ['user', 'admin'], default: 'user' },
+
+    // ── Account deletion ────────────────────────────────────────────────────
+    // Deletion is implemented as anonymization, not a hard document delete —
+    // the User document is kept (as a scrubbed stub) so Messages/Matches/
+    // Likes/Reports that reference this id via populate() keep resolving
+    // instead of leaving dangling references. isActive is also set false on
+    // deletion, which is what actually blocks login/protect/socket auth —
+    // isDeleted/deletedAt exist for admin visibility and to distinguish
+    // "user deleted their own account" from "banned"/"deactivated".
+    // See userController.anonymizeUser.
+    isDeleted: { type: Boolean, default: false },
+    deletedAt: { type: Date,    default: null  },
+
+    // ── Blocking ────────────────────────────────────────────────────────────
+    // Users this account has blocked. One-directional by design (A blocking B
+    // doesn't imply B blocked A) — enforcement everywhere checks both
+    // "did I block them" and "did they block me" by querying this field from
+    // both sides. See userController.blockUser/unblockUser.
+    blockedUsers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   },
   { timestamps: true }
 );
@@ -138,6 +182,11 @@ userSchema.pre('save', async function () {
 
 
 userSchema.methods.comparePassword = async function (candidate) {
+  // Google-only accounts have no password hash — bcrypt.compare would throw
+  // on a non-hash string instead of just returning false, which surfaced as
+  // a 500 (instead of a clean 401) if a Google user ever tried the
+  // email/password login form. Treat "no password set" as "never matches".
+  if (!this.password) return false;
   return bcrypt.compare(candidate, this.password);
 };
 
@@ -148,7 +197,8 @@ userSchema.methods.isOtpValid = function (otp) {
 
 
 // ── Indexes ───────────────────────────────────────────────────────────────────
-userSchema.index({ location: '2dsphere' }); 
+userSchema.index({ location: '2dsphere' });
+userSchema.index({ blockedUsers: 1 }); // fast "who has blocked me" reverse lookup
 
 
 module.exports = mongoose.model('User', userSchema);

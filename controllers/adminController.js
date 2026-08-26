@@ -3,6 +3,7 @@ const User    = require('../models/User');
 const Post    = require('../models/Post');
 const Report  = require('../models/Report');
 const Message = require('../models/Message');
+const { anonymizeUser } = require('./userController');
 
 // Safely import Match models (file exports { Like, Match })
 let Like, MatchModel;
@@ -223,10 +224,20 @@ exports.updateUser = async (req, res) => {
   }
 };
 
+// Deletion = anonymization, not a hard document delete — see
+// userController.anonymizeUser for why (keeps Messages/Matches/Likes/Reports
+// that reference this id resolving instead of dangling). Previously this
+// was a raw findByIdAndDelete with no cleanup of any of those, which had a
+// confirmed crash path in messageController.getConversations for the other
+// party in an active match.
 exports.deleteUser = async (req, res) => {
   try {
-    const user = await User.findByIdAndDelete(req.params.id);
+    const user = await User.findById(req.params.id).select('_id');
     if (!user) return res.status(404).json({ message: 'User not found' });
+
+    await anonymizeUser(req.params.id);
+    console.log(`🗑️ [Admin] User ${req.params.id} deleted (anonymized) by admin ${req.user._id}`);
+
     res.json({ message: 'User deleted' });
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -410,7 +421,7 @@ exports.broadcastNotification = async (req, res) => {
     const { target = 'all', title, body: notifBody, type = 'push' } = req.body;
     if (!title || !notifBody) return res.status(400).json({ message: 'title and body are required' });
 
-    let filter = { pushToken: { $ne: null }, isActive: true, isBanned: false };
+    let filter = { 'pushTokens.0': { $exists: true }, isActive: true, isBanned: false };
     if (target === 'boosted')  { filter.isBoosted    = true; }
     if (target === 'premium')  { filter.isSubscribed = true; }
     if (target === 'inactive') {
@@ -418,8 +429,9 @@ exports.broadcastNotification = async (req, res) => {
       filter.lastSeen = { $lt: weekAgo };
     }
 
-    const users  = await User.find(filter).select('pushToken');
-    const tokens = users.map(u => u.pushToken).filter(Boolean);
+    const users  = await User.find(filter).select('pushTokens');
+    // Flatten every matching user's device tokens into one list, deduped.
+    const tokens = [...new Set(users.flatMap(u => u.pushTokens || []))];
 
     if (tokens.length === 0) return res.json({ message: 'No devices to notify', sent: 0 });
 

@@ -197,12 +197,20 @@ exports.deletePost = async (req, res) => {
 exports.getMyPosts = async (req, res) => {
   try {
     const now   = new Date();
-    const posts = await Post.find({
-      author:    req.user._id,
-      expiresAt: { $gt: now },
-    })
-      .sort({ createdAt: -1 })
-      .lean();
+    const page  = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit = Math.min(100, parseInt(req.query.limit) || 50);
+    const skip  = (page - 1) * limit;
+
+    const filter = { author: req.user._id, expiresAt: { $gt: now } };
+
+    const [posts, total] = await Promise.all([
+      Post.find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Post.countDocuments(filter),
+    ]);
 
     const result = posts.map((p) => ({
       ...p,
@@ -210,7 +218,14 @@ exports.getMyPosts = async (req, res) => {
       timeLeft:  Math.max(0, p.expiresAt - now),
     }));
 
-    res.status(200).json({ success: true, posts: result });
+    res.status(200).json({
+      success: true,
+      posts: result,
+      page,
+      total,
+      totalPages: Math.ceil(total / limit),
+      hasMore: skip + posts.length < total,
+    });
   } catch (err) {
     console.error('❌ [Community] getMyPosts:', err.message);
     res.status(500).json({ success: false, message: 'Failed to fetch posts.' });
