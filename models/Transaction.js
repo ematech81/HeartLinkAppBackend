@@ -16,7 +16,7 @@ const transactionSchema = new mongoose.Schema(
   {
     user:              { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     checkoutReference: { type: String, required: true, unique: true },
-    plan:              { type: String, enum: ['monthly', 'yearly', 'boost'], required: true },
+    plan:              { type: String, enum: ['monthly', 'sixMonth', 'boost'], required: true },
     amount:            { type: Number, required: true },
     currency:          { type: String, default: 'NGN' },
     // 'pending' → 'success' is the only transition that should ever trigger

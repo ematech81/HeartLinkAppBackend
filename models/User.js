@@ -137,7 +137,7 @@ const userSchema = new mongoose.Schema(
     // ── Subscription ───────────────────────────────────────────────────────────
     isSubscribed:       { type: Boolean, default: false },
     subscriptionExpiry: { type: Date,    default: null  },
-    subscriptionPlan:   { type: String,  enum: ['monthly', 'yearly'], default: null },
+    subscriptionPlan:   { type: String,  enum: ['monthly', 'sixMonth'], default: null },
 
     // ── Boost ──────────────────────────────────────────────────────────────────
     isBoosted:   { type: Boolean, default: false },

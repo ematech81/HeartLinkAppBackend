@@ -34,10 +34,14 @@ const PLANS = {
     durationMs:  30 * 24 * 60 * 60 * 1000,
     freeBoostMs: 0,
   },
-  yearly: {
-    label:       'Yearly',
+  // Was a 365-day "yearly" plan at the same ₦20,000 price — now 6 months
+  // (180 days, i.e. 6 × the monthly plan's own 30-day approximation, for
+  // internal consistency rather than introducing a different day-count
+  // assumption).
+  sixMonth: {
+    label:       '6 Months',
     amount:      20000,
-    durationMs:  365 * 24 * 60 * 60 * 1000,
+    durationMs:  6 * 30 * 24 * 60 * 60 * 1000,
     freeBoostMs: 7 * 24 * 60 * 60 * 1000,
   },
   boost: {
@@ -82,7 +86,7 @@ const activatePlan = async (userId, plan) => {
       subscriptionPlan:   plan,
       isVerified:         true,
     };
-    if (plan === 'yearly') {
+    if (plan === 'sixMonth') {
       const boostBase = stillActive(current?.boostExpiry) ? new Date(current.boostExpiry).getTime() : now;
       fields.isBoosted   = true;
       fields.boostExpiry = new Date(boostBase + cfg.freeBoostMs);
@@ -150,7 +154,7 @@ const expireIfNeeded = async (userId) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/initialize
 // Creates a KoraPay hosted-checkout link and returns it to the app.
-// Body: { plan: 'monthly' | 'yearly' | 'boost' }
+// Body: { plan: 'monthly' | 'sixMonth' | 'boost' }
 // ─────────────────────────────────────────────────────────────────────────────
 exports.initializePayment = async (req, res) => {
   let transaction;
@@ -292,8 +296,8 @@ exports.verifyPayment = async (req, res) => {
 
     res.json({
       success: true,
-      message: txn.plan === 'yearly'
-        ? 'Yearly subscription activated! You also get 1 week of free profile boosting.'
+      message: txn.plan === 'sixMonth'
+        ? '6-Month subscription activated! You also get 1 week of free profile boosting.'
         : txn.plan === 'monthly'
           ? 'Monthly subscription activated!'
           : 'Profile boost activated for 7 days!',

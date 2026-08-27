@@ -4,6 +4,7 @@ const Post    = require('../models/Post');
 const Report  = require('../models/Report');
 const Message = require('../models/Message');
 const { anonymizeUser } = require('./userController');
+const { PLANS } = require('./paymentController');
 
 // Safely import Match models (file exports { Like, Match })
 let Like, MatchModel;
@@ -376,19 +377,26 @@ exports.getSubscriptions = async (req, res) => {
       .skip(skip)
       .limit(parseInt(limit));
 
-    // Revenue estimate (simple — based on plan counts)
-    const [monthly, yearly] = await Promise.all([
+    // Revenue estimate (simple — based on plan counts). Amounts are pulled
+    // from PLANS (paymentController.js) rather than hardcoded here a second
+    // time — this exact duplication is what let these numbers silently
+    // drift out of sync with the real prices before (this was already
+    // wrong pre-existing: monthly was priced at ₦2,500 here vs. the real
+    // ₦5,000, and "yearly" was still being counted after the plan was
+    // renamed to sixMonth).
+    const [monthly, sixMonth] = await Promise.all([
       User.countDocuments({ role: 'user', isSubscribed: true, subscriptionPlan: 'monthly' }),
-      User.countDocuments({ role: 'user', isSubscribed: true, subscriptionPlan: 'yearly' }),
+      User.countDocuments({ role: 'user', isSubscribed: true, subscriptionPlan: 'sixMonth' }),
     ]);
-    const estimatedMonthlyRevenue = (monthly * 2500) + (yearly * 18000 / 12);
+    const estimatedMonthlyRevenue =
+      (monthly * PLANS.monthly.amount) + (sixMonth * PLANS.sixMonth.amount / 6);
 
     res.json({
       users,
       total,
       page:       parseInt(page),
       totalPages: Math.ceil(total / parseInt(limit)),
-      revenue: { monthly, yearly, estimatedMonthlyRevenue },
+      revenue: { monthly, sixMonth, estimatedMonthlyRevenue },
     });
   } catch (err) {
     res.status(500).json({ message: err.message });
