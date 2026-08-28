@@ -42,4 +42,17 @@ const passwordResetLimiter = rateLimit({
   message: { success: false, message: 'Too many reset attempts. Please wait a few minutes and try again.' },
 });
 
-module.exports = { authLimiter, otpLimiter, passwordResetLimiter };
+// Messaging PIN verify guards a 4-digit code — only 10,000 combos, so this
+// needs to be tighter than even the OTP limiter. The per-user DB-tracked
+// lockout in userController.verifyMessagingPin is the primary defense (it
+// survives a client switching IPs); this is a secondary, IP-keyed layer on
+// top of it.
+const pinLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many PIN attempts. Please wait a few minutes and try again.' },
+});
+
+module.exports = { authLimiter, otpLimiter, passwordResetLimiter, pinLimiter };

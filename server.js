@@ -5,25 +5,46 @@ const cors       = require('cors');
 const helmet     = require('helmet');
 const dotenv     = require('dotenv');
 const jwt        = require('jsonwebtoken');
+const mongoose   = require('mongoose');
 const connectDB  = require('./config/db');
 const User       = require('./models/User');
 
 dotenv.config();
 connectDB();
 
+// ── Run a startup task only once Mongo is actually connected ─────────────────
+// Both cron jobs below used to fire on a flat timer (or immediately) with no
+// regard for whether connectDB() had actually finished yet — on a cold boot,
+// or any time Atlas connect is slow, they'd race ahead of it, throwing
+// "buffering timed out" (queries queued with nowhere to go) instead of
+// running cleanly a few seconds later. mongoose.connection is a singleton,
+// so this doesn't open a second connection — it just waits on the same one
+// config/db.js already establishes.
+const runWhenDbReady = (fn) => {
+  if (mongoose.connection.readyState === 1) fn();
+  else mongoose.connection.once('connected', fn);
+};
+
 // ── Daily expiry check (runs every 6 hours) ───────────────────────────────────
 const { runExpiryCheck } = require('./controllers/paymentController');
 const runDailyExpiry = async () => {
   try {
     const fakeReq = {};
-    const fakeRes = { json: (d) => console.log('⏰ [Cron] Expiry result:', d) };
+    // status() must be chainable (return the mock itself) — runExpiryCheck's
+    // own catch block calls res.status(500).json(...), and a mock missing
+    // .status() turned every real error inside it into a second, misleading
+    // "res.status is not a function" TypeError that masked the actual cause.
+    const fakeRes = {
+      status: () => fakeRes,
+      json:   (d) => console.log('⏰ [Cron] Expiry result:', d),
+    };
     await runExpiryCheck(fakeReq, fakeRes);
   } catch (err) {
     console.error('❌ [Cron] Expiry check failed:', err.message);
   }
 };
-// Run once on startup, then every 6 hours
-setTimeout(runDailyExpiry, 5000);
+// Run once on startup (as soon as Mongo is ready, not a guessed delay), then every 6 hours
+runWhenDbReady(runDailyExpiry);
 setInterval(runDailyExpiry, 6 * 60 * 60 * 1000);
 
 const app    = express();
@@ -220,7 +241,7 @@ app.use('/api/admin',     adminRoutes);
 // Cleanup expired community posts every hour
 const { cleanupExpiredPosts } = require('./controllers/communityController');
 setInterval(cleanupExpiredPosts, 60 * 60 * 1000);
-cleanupExpiredPosts(); // run once on startup
+runWhenDbReady(cleanupExpiredPosts); // run once on startup, once Mongo is ready
 
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((req, res) => {

@@ -1,3 +1,4 @@
+const bcrypt = require('bcryptjs');
 const User   = require('../models/User');
 const { Like, Match } = require('../models/Match');
 const Report = require('../models/Report');
@@ -505,6 +506,169 @@ exports.deleteMe = async (req, res) => {
     res.status(200).json({ success: true, message: 'Your account has been deleted.' });
   } catch (error) {
     console.error('❌ [DeleteMe] Error:', error.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Messaging PIN — Premium-only "app lock" for chats (like Messenger's App
+// Lock). Gated server-side on an active subscription on every endpoint below
+// — never trust the client-side gate alone, since these are reachable
+// directly by anyone with a valid token regardless of what the app UI shows.
+// ─────────────────────────────────────────────────────────────────────────────
+const isSubscriptionActive = (user) =>
+  !!user?.isSubscribed && (!user.subscriptionExpiry || new Date(user.subscriptionExpiry) > new Date());
+
+// GET /api/users/messaging-pin/status
+exports.getMessagingPinStatus = async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id).select('+messagingPinHash isSubscribed subscriptionExpiry');
+    res.status(200).json({
+      success:      true,
+      isSubscribed: isSubscriptionActive(user),
+      hasPin:       !!user.messagingPinHash,
+    });
+  } catch (error) {
+    console.error('❌ [MessagingPin] Status error:', error.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+// POST /api/users/messaging-pin
+// Body: { pin, currentPin? } — currentPin required only when changing an
+// already-set PIN (proves the caller knows it); first-time setup needs none.
+exports.setMessagingPin = async (req, res) => {
+  try {
+    const { pin, currentPin } = req.body;
+
+    const user = await User.findById(req.user._id).select('+messagingPinHash isSubscribed subscriptionExpiry');
+    if (!isSubscriptionActive(user)) {
+      return res.status(403).json({ success: false, message: 'Messaging PIN is a Premium feature.' });
+    }
+    if (!/^\d{4}$/.test(pin || '')) {
+      return res.status(400).json({ success: false, message: 'PIN must be exactly 4 digits.' });
+    }
+
+    if (user.messagingPinHash) {
+      // 400, not 401 — the frontend's axios interceptor auto-clears the
+      // whole session on any 401 (correct for a bad/expired JWT, but this is
+      // an app-level "wrong secondary credential" check, not an auth
+      // failure — a 401 here would silently log the user out over a typo).
+      if (!currentPin || !(await bcrypt.compare(currentPin, user.messagingPinHash))) {
+        return res.status(400).json({ success: false, message: 'Current PIN is incorrect.' });
+      }
+    }
+
+    const wasChange = !!user.messagingPinHash;
+    user.messagingPinHash        = await bcrypt.hash(pin, 10);
+    user.messagingPinAttempts    = 0;
+    user.messagingPinLockedUntil = null;
+    await user.save({ validateBeforeSave: false });
+
+    console.log(`🔒 [MessagingPin] PIN ${wasChange ? 'updated' : 'set'} for ${user._id}`);
+    res.status(200).json({ success: true, message: 'Messaging PIN saved.' });
+  } catch (error) {
+    console.error('❌ [MessagingPin] Set error:', error.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+// POST /api/users/messaging-pin/verify
+// Body: { pin }
+// 5 wrong attempts → 2-minute lockout. Tracked per-user in the DB (not just
+// the IP-keyed pinLimiter above it) so switching networks doesn't reset it.
+exports.verifyMessagingPin = async (req, res) => {
+  try {
+    const { pin } = req.body;
+    const user = await User.findById(req.user._id)
+      .select('+messagingPinHash +messagingPinAttempts +messagingPinLockedUntil isSubscribed subscriptionExpiry');
+
+    if (!isSubscriptionActive(user)) {
+      return res.status(403).json({ success: false, message: 'Messaging PIN is a Premium feature.' });
+    }
+    if (!user.messagingPinHash) {
+      return res.status(400).json({ success: false, message: 'No PIN set yet.' });
+    }
+
+    if (user.messagingPinLockedUntil && user.messagingPinLockedUntil > new Date()) {
+      const secondsLeft = Math.ceil((user.messagingPinLockedUntil - Date.now()) / 1000);
+      return res.status(429).json({
+        success: false,
+        locked:  true,
+        secondsLeft,
+        message: `Too many incorrect attempts. Try again in ${secondsLeft}s.`,
+      });
+    }
+
+    const isMatch = typeof pin === 'string' && await bcrypt.compare(pin, user.messagingPinHash);
+    if (!isMatch) {
+      user.messagingPinAttempts = (user.messagingPinAttempts || 0) + 1;
+      let locked = false;
+      if (user.messagingPinAttempts >= 5) {
+        user.messagingPinLockedUntil = new Date(Date.now() + 2 * 60 * 1000);
+        user.messagingPinAttempts    = 0; // the lockout itself is now the deterrent
+        locked = true;
+      }
+      await user.save({ validateBeforeSave: false });
+      // 400, not 401 — see the identical note on setMessagingPin above. This
+      // is the endpoint a wrong PIN hits on every single mistyped digit, so
+      // getting this one right matters most: a 401 here would silently
+      // sign the user out of the whole app just for a typo.
+      return res.status(400).json({
+        success: false,
+        locked,
+        attemptsRemaining: locked ? 0 : Math.max(0, 5 - user.messagingPinAttempts),
+        message: locked ? 'Too many incorrect attempts. Try again in 2 minutes.' : 'Incorrect PIN.',
+      });
+    }
+
+    user.messagingPinAttempts    = 0;
+    user.messagingPinLockedUntil = null;
+    await user.save({ validateBeforeSave: false });
+
+    res.status(200).json({ success: true, message: 'PIN verified.' });
+  } catch (error) {
+    console.error('❌ [MessagingPin] Verify error:', error.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+// POST /api/users/messaging-pin/reset
+// Body: { password, newPin } — "forgot PIN" path: re-prove identity with the
+// account password (mirrors deleteMe's pattern) rather than the old PIN.
+exports.resetMessagingPin = async (req, res) => {
+  try {
+    const { password, newPin } = req.body;
+    if (!/^\d{4}$/.test(newPin || '')) {
+      return res.status(400).json({ success: false, message: 'New PIN must be exactly 4 digits.' });
+    }
+
+    const user = await User.findById(req.user._id).select('+password isSubscribed subscriptionExpiry');
+    if (!isSubscriptionActive(user)) {
+      return res.status(403).json({ success: false, message: 'Messaging PIN is a Premium feature.' });
+    }
+
+    // Google-only accounts have no password — a currently-valid JWT is
+    // treated as sufficient proof for those, same as deleteMe above.
+    // 400, not 401 — see the note on setMessagingPin/verifyMessagingPin
+    // above; a 401 here would silently sign the user out over a mistyped
+    // password during PIN recovery, which is exactly the moment they can
+    // least afford to be logged out.
+    if (user.authProvider === 'local') {
+      if (!password || !(await user.comparePassword(password))) {
+        return res.status(400).json({ success: false, message: 'Incorrect password.' });
+      }
+    }
+
+    user.messagingPinHash        = await bcrypt.hash(newPin, 10);
+    user.messagingPinAttempts    = 0;
+    user.messagingPinLockedUntil = null;
+    await user.save({ validateBeforeSave: false });
+
+    console.log(`🔒 [MessagingPin] PIN reset via password for ${user._id}`);
+    res.status(200).json({ success: true, message: 'Messaging PIN reset.' });
+  } catch (error) {
+    console.error('❌ [MessagingPin] Reset error:', error.message);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };

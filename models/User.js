@@ -27,17 +27,36 @@ const userSchema = new mongoose.Schema(
     },
 
     // ── Step 2: Personal Info ──────────────────────────────────────────────
+    // All five of these were unconditionally `required: true` — same bug
+    // class as the password fix above, but not caught by it: Google's
+    // User.create() never provides any of these either (they're filled in
+    // during the post-signup "complete your profile" step), so every
+    // first-time Google sign-up has ALSO been failing with a
+    // ValidationError this whole time, independent of the password fix.
+    // Gated on isProfileComplete (defaults to true, so normal single-shot
+    // local registration is unaffected) rather than authProvider, since the
+    // same "create now, complete profile later" shape now applies to local
+    // accounts too (verify-email-first registration), not just Google.
     gender: {
       type: String, enum: ['male', 'female'],
-      required: [true, 'Gender is required'],
+      required: [function () { return this.isProfileComplete; }, 'Gender is required'],
     },
-    dateOfBirth: { type: Date, required: [true, 'Date of birth is required'] },
-    country:     { type: String, required: true, trim: true },
-    city:        { type: String, required: true, trim: true },
+    dateOfBirth: {
+      type: Date,
+      required: [function () { return this.isProfileComplete; }, 'Date of birth is required'],
+    },
+    country: {
+      type: String, trim: true,
+      required: [function () { return this.isProfileComplete; }, 'Country is required'],
+    },
+    city: {
+      type: String, trim: true,
+      required: [function () { return this.isProfileComplete; }, 'City is required'],
+    },
     relationshipType: {
       type: String,
       enum: ['single', 'single_mother', 'single_father'],
-      required: true,
+      required: [function () { return this.isProfileComplete; }, 'Relationship type is required'],
     },
 
     // ── Step 3: Looking For ────────────────────────────────────────────────
@@ -97,7 +116,7 @@ const userSchema = new mongoose.Schema(
     // ── Social auth ────────────────────────────────────────────────────────
     authProvider:      { type: String, enum: ['local', 'google'], default: 'local' },
     googleId:          { type: String, default: null },
-    isProfileComplete: { type: Boolean, default: true }, // false for new Google sign-in users
+    isProfileComplete: { type: Boolean, default: true }, // false for a brand-new account still completing profile (Google sign-in, or local email/phone registration — see AuthController.register)
 
     // ── Consent ─────────────────────────────────────────────────────────────
     // Server-stamped (never trust a client-supplied timestamp) the moment the
@@ -122,6 +141,17 @@ const userSchema = new mongoose.Schema(
     // ── Password reset ─────────────────────────────────────────────────────
     resetPasswordToken:   { type: String, select: false },
     resetPasswordExpires: { type: Date,   select: false },
+
+    // ── Messaging PIN (Premium-only "app lock" for chats, like Messenger) ──
+    // Hashed the same way as `password` (bcrypt, see the pre('save') hook
+    // below — messagingPinHash is intentionally NOT run through that hook,
+    // since it's a separate 4-digit secret set well after account creation;
+    // controllers hash it explicitly with bcrypt themselves instead).
+    // Attempts/lockout guard the tiny 10,000-combo keyspace a 4-digit PIN
+    // has against brute-forcing — see userController.verifyMessagingPin.
+    messagingPinHash:        { type: String, select: false, default: null },
+    messagingPinAttempts:    { type: Number, select: false, default: 0 },
+    messagingPinLockedUntil: { type: Date,   select: false, default: null },
 
     // ── Push notifications ─────────────────────────────────────────────────
     // `pushToken` (singular) is deprecated — kept only so existing documents

@@ -5,13 +5,25 @@ const { generateOtp, sendOtp } = require('../utils/SendOTP'); // actual BulkSMS 
 const { sendPasswordResetEmail, sendEmail, sendVerificationEmail } = require('../utils/SendEmail'); // actual Brevo sending lives here
 const { otpExpiryDate } = require('../utils/otp'); // shared expiry policy (OTP_EXPIRES_MINUTES) for both SMS OTP and the email reset code below
 const axios = require('axios');
-const { validateMinAge } = require('../utils/age');
+// Age validation (validateMinAge) now happens in userController.updateProfile,
+// where dateOfBirth is actually collected — not here (see register() below).
 // NOTE: this file previously also imported `twilio` directly and
 // `{ OAuth2Client }` from google-auth-library — both unused (the actual
 // SMS client lives in utils/SendOTP.js; googleAuth below verifies via
 // Google's userinfo HTTP endpoint rather than OAuth2Client.verifyIdToken,
 // which is a valid approach but never used that import). Removed as dead
 // code rather than leaving unused imports around.
+
+// ── Console-log OTPs for local testing ──────────────────────────────────────
+// The phone OTP path (sendOtp below) already skips real SMS and logs to
+// console outside production. Email OTPs (register/resendEmailOtp) never had
+// an equivalent — they always went out for real via Brevo only, with no fast
+// local-testing path, even though FORCE_CONSOLE_OTP has sat in .env/.env.example
+// unused this whole time. This logs *alongside* the real email send (not
+// instead of it) whenever not in production, or whenever FORCE_CONSOLE_OTP is
+// explicitly set — so you don't have to wait on/check an inbox while testing.
+const shouldLogOtpToConsole = () =>
+  process.env.NODE_ENV !== 'production' || process.env.FORCE_CONSOLE_OTP === 'true';
 
 // ── Sign JWT ──────────────────────────────────────────────────────────────────
 const signToken = (id) =>
@@ -44,42 +56,27 @@ exports.register = async (req, res) => {
  
     const {
       name, email, phone, password,
-      gender, dateOfBirth, country, city, relationshipType,
-      lookingFor, education, drink, smoke, religion,
-      profession, bio, height, interests,
-      numberOfKids, kidsAges,
-      agreedToTerms,
+      // gender/dateOfBirth/country/city/relationshipType/agreedToTerms are
+      // deliberately NOT read here anymore. Registration now happens in two
+      // stages (2026-08-27): this endpoint creates a minimal, unverified
+      // account from step 1 (name/email/phone/password) alone, sends the
+      // verification code immediately, and the remaining profile-detail
+      // steps are collected afterward via the authenticated
+      // PUT /api/users/profile (updateProfile) — the exact same
+      // "create now, complete profile later" shape Google sign-in already
+      // uses (isProfileComplete:false → profile-completion screen). The age
+      // check and the Terms/Privacy consent stamp both move with
+      // dateOfBirth/agreedToTerms to that later step (see
+      // userController.updateProfile, which already enforces both).
     } = req.body;
 
-    // 1. Required fields check
-    if (!name || !password || !gender || !dateOfBirth || !country || !city || !relationshipType) {
-      const missing = ['name','password','gender','dateOfBirth','country','city','relationshipType']
-        .filter(f => !req.body[f]);
+    // 1. Required fields check — step 1 fields only.
+    if (!name || !password) {
+      const missing = ['name', 'password'].filter(f => !req.body[f]);
       console.log('❌ [Register] Missing fields:', missing);
       return res.status(400).json({
         success: false,
         message: `Missing required fields: ${missing.join(', ')}`,
-      });
-    }
-
-    // 1b. Age check — the app's registration form already blocks under-18s
-    // client-side (and requires an explicit 18+ consent checkbox), but the
-    // API itself must not trust that; anyone calling it directly bypassed
-    // both checks entirely before this.
-    const ageError = validateMinAge(dateOfBirth);
-    if (ageError) {
-      console.log('❌ [Register] Age check failed:', ageError);
-      return res.status(400).json({ success: false, message: ageError });
-    }
-
-    // 1c. Consent — must match the app's Terms/Privacy/guidelines agreement
-    // modal. Recorded server-side (agreedToTermsAt) as the durable
-    // proof-of-consent record; a client-supplied timestamp is never trusted,
-    // only the boolean flag as a trigger to stamp "now".
-    if (agreedToTerms !== true) {
-      return res.status(400).json({
-        success: false,
-        message: 'You must agree to the Terms & Conditions to create an account.',
       });
     }
 
@@ -106,24 +103,16 @@ exports.register = async (req, res) => {
       });
     }
  
-    // 4. Create user
+    // 4. Create user — minimal record, same shape as the Google new-user
+    // path in googleAuth() below. Profile-detail fields (gender, DOB,
+    // country/city, relationshipType, etc.) and the Terms/Privacy consent
+    // stamp are collected afterward via updateProfile, once the account is
+    // verified and authenticated.
     const userData = {
       name, password,
-      gender, dateOfBirth, country, city, relationshipType,
-      agreedToTermsAt: new Date(), // stamped server-side, never client-supplied
-      ...(email      && { email: email.toLowerCase() }),
-      ...(phone      && { phone }),
-      ...(lookingFor && { lookingFor }),
-      ...(education  && { education }),
-      ...(drink      && { drink }),
-      ...(smoke      && { smoke }),
-      ...(religion   && { religion }),
-      ...(profession && { profession }),
-      ...(bio        && { bio }),
-      ...(height     && { height: Number(height) }),
-      ...(interests?.length  && { interests }),
-      ...(numberOfKids       && { numberOfKids: Number(numberOfKids) }),
-      ...(kidsAges?.length   && { kidsAges }),
+      isProfileComplete: false,
+      ...(email && { email: email.toLowerCase() }),
+      ...(phone && { phone }),
     };
  
     console.log('💾 [Register] Creating user:', { ...userData, password: '***' });
@@ -141,6 +130,10 @@ exports.register = async (req, res) => {
       user.emailOtp        = otp;
       user.emailOtpExpires = otpExpiryDate();
       await user.save({ validateBeforeSave: false });
+
+      if (shouldLogOtpToConsole()) {
+        console.log(`📧 [Register] *** DEV MODE — Email OTP for ${email}: ${otp} ***`);
+      }
 
       try {
         await sendVerificationEmail(email, otp, name);
@@ -187,6 +180,16 @@ exports.register = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: `This ${field} is already registered.`,
+      });
+    }
+    // Atlas connectivity hiccup (see config/db.js — now fails within 8s,
+    // inside the client's own 15s timeout, specifically so this branch is
+    // reachable instead of the client always giving up first with a bare
+    // "Network Error" and no idea what actually happened server-side).
+    if (['MongooseServerSelectionError', 'MongoServerSelectionError', 'MongoNetworkError', 'MongoTimeoutError'].includes(error.name)) {
+      return res.status(503).json({
+        success: false,
+        message: 'We\'re having trouble reaching our database right now. Please try again in a moment.',
       });
     }
     res.status(500).json({ success: false, message: error.message || 'Server error.' });
@@ -507,6 +510,10 @@ exports.resendEmailOtp = async (req, res) => {
     user.emailOtp        = otp;
     user.emailOtpExpires = otpExpiryDate();
     await user.save({ validateBeforeSave: false });
+
+    if (shouldLogOtpToConsole()) {
+      console.log(`📧 [ResendEmailOtp] *** DEV MODE — Email OTP for ${email}: ${otp} ***`);
+    }
 
     await sendVerificationEmail(user.email, otp, user.name);
 
