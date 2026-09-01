@@ -242,6 +242,11 @@ userSchema.methods.isEmailOtpValid = function (otp) {
 // ── Indexes ───────────────────────────────────────────────────────────────────
 userSchema.index({ location: '2dsphere' });
 userSchema.index({ blockedUsers: 1 }); // fast "who has blocked me" reverse lookup
+// Backs getTopProfiles' find({isBoosted:true, boostExpiry:{$gt:now}}).sort({boostExpiry:-1}) —
+// without this it's a full collection scan on every load of the Top
+// Profiles row, getting slower as the user base grows regardless of how few
+// users are actually boosted at once.
+userSchema.index({ isBoosted: 1, boostExpiry: -1 });
 
 
 module.exports = mongoose.model('User', userSchema);

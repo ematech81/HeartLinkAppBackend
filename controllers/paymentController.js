@@ -389,24 +389,52 @@ exports.korapayWebhook = async (req, res) => {
 // which already takes an explicit target user id and is adminProtect-gated.
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/payment/top-profiles
+// GET /api/payment/top-profiles?page=1&limit=15
+//
+// Was a flat, unpaginated `.limit(20)` with no way to see anything beyond
+// those 20 — fine while boosts were rare, but a busy app can easily have far
+// more than 20 concurrently boosted users (boosts are cheap and stack from
+// both the ₦3,000 standalone purchase and the free week bundled with the
+// 6-month plan), and the other 980 would simply never be shown to anyone.
+// Paginated now so the "View All" grid (LikesScreen's Top Profiles tab) can
+// page through everyone currently boosted, not just the most recent 20.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getTopProfiles = async (req, res) => {
   try {
     const now   = new Date();
-    const users = await User.find({
+    const page  = Math.max(1, parseInt(req.query.page)  || 1);
+    // Capped at 50/page regardless of what's requested — this is a public-ish
+    // browse endpoint, no reason to let a client ask for an unbounded page size.
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 15));
+    const skip  = (page - 1) * limit;
+
+    const filter = {
       isBoosted:       true,
       boostExpiry:     { $gt: now },
       _id:             { $ne: req.user._id },
       isActive:        true,
       isBanned:        false,
       isProfileHidden: false,
-    })
-      .select('name dateOfBirth city country profession profilePicture photos isVerified isBoosted isOnline interests boostExpiry')
-      .sort({ boostExpiry: -1 })
-      .limit(20)
-      .lean();
-    res.json({ success: true, users });
+    };
+
+    const [users, totalCount] = await Promise.all([
+      User.find(filter)
+        .select('name dateOfBirth city country profession profilePicture photos isVerified isBoosted isOnline interests boostExpiry')
+        .sort({ boostExpiry: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      User.countDocuments(filter),
+    ]);
+
+    res.json({
+      success: true,
+      users,
+      page,
+      totalPages: Math.ceil(totalCount / limit) || 1,
+      totalCount,
+      hasMore: skip + users.length < totalCount,
+    });
   } catch (err) {
     console.error('❌ [Payment] TopProfiles error:', err.message);
     res.status(500).json({ success: false, message: 'Server error.' });

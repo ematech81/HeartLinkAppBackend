@@ -522,7 +522,16 @@ const isSubscriptionActive = (user) =>
 // GET /api/users/messaging-pin/status
 exports.getMessagingPinStatus = async (req, res) => {
   try {
-    const user = await User.findById(req.user._id).select('+messagingPinHash isSubscribed subscriptionExpiry');
+    // '+field' ALONE just adds that select:false field on top of the normal
+    // default projection — mixing it with plain field names (as this used
+    // to do) silently switches Mongoose into inclusion-ONLY mode, dropping
+    // every other field (including authProvider) from the result. Caught
+    // live: it made resetMessagingPin's `user.authProvider === 'local'`
+    // check evaluate against `undefined`, silently skipping the password
+    // verification entirely. isSubscribed/subscriptionExpiry don't need
+    // listing here at all — they're normal fields, already returned by
+    // default.
+    const user = await User.findById(req.user._id).select('+messagingPinHash');
     res.status(200).json({
       success:      true,
       isSubscribed: isSubscriptionActive(user),
@@ -541,7 +550,16 @@ exports.setMessagingPin = async (req, res) => {
   try {
     const { pin, currentPin } = req.body;
 
-    const user = await User.findById(req.user._id).select('+messagingPinHash isSubscribed subscriptionExpiry');
+    // '+field' ALONE just adds that select:false field on top of the normal
+    // default projection — mixing it with plain field names (as this used
+    // to do) silently switches Mongoose into inclusion-ONLY mode, dropping
+    // every other field (including authProvider) from the result. Caught
+    // live: it made resetMessagingPin's `user.authProvider === 'local'`
+    // check evaluate against `undefined`, silently skipping the password
+    // verification entirely. isSubscribed/subscriptionExpiry don't need
+    // listing here at all — they're normal fields, already returned by
+    // default.
+    const user = await User.findById(req.user._id).select('+messagingPinHash');
     if (!isSubscriptionActive(user)) {
       return res.status(403).json({ success: false, message: 'Messaging PIN is a Premium feature.' });
     }
@@ -581,7 +599,7 @@ exports.verifyMessagingPin = async (req, res) => {
   try {
     const { pin } = req.body;
     const user = await User.findById(req.user._id)
-      .select('+messagingPinHash +messagingPinAttempts +messagingPinLockedUntil isSubscribed subscriptionExpiry');
+      .select('+messagingPinHash +messagingPinAttempts +messagingPinLockedUntil'); // see the select() note above
 
     if (!isSubscriptionActive(user)) {
       return res.status(403).json({ success: false, message: 'Messaging PIN is a Premium feature.' });
@@ -643,7 +661,7 @@ exports.resetMessagingPin = async (req, res) => {
       return res.status(400).json({ success: false, message: 'New PIN must be exactly 4 digits.' });
     }
 
-    const user = await User.findById(req.user._id).select('+password isSubscribed subscriptionExpiry');
+    const user = await User.findById(req.user._id).select('+password'); // see the select() note above
     if (!isSubscriptionActive(user)) {
       return res.status(403).json({ success: false, message: 'Messaging PIN is a Premium feature.' });
     }
