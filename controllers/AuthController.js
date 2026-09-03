@@ -354,6 +354,11 @@ exports.resetPassword = async (req, res) => {
 // POST /api/auth/send-otp
 // Send a 6-character alphanumeric OTP to the given phone number via BulkSMS.
 // The user must already have an account with that phone number.
+//
+// DISABLED (2026-09-03) — unrouted in authRoutes.js. BulkSMS was only
+// delivering OTPs after 10am daily, making phone login unreliable; this
+// function itself is left working in case a more reliable SMS provider
+// replaces BulkSMS later.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.sendOtp = async (req, res) => {
   try {
@@ -393,6 +398,7 @@ exports.sendOtp = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/auth/verify-otp
+// DISABLED (2026-09-03) — unrouted in authRoutes.js, see sendOtp's note above.
 // Verify the OTP and return a JWT if valid.
 // Body: { phone, otp }
 // ─────────────────────────────────────────────────────────────────────────────
@@ -527,6 +533,9 @@ exports.resendEmailOtp = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/auth/google
+// DISABLED (2026-09-03) — unrouted in authRoutes.js; Google Sign-In wasn't
+// working client-side. Email/password is the only account path for now —
+// this function is left intact in case Google sign-in is revisited later.
 // Verify a Google access token (via Google's userinfo endpoint — Google's
 // servers do the actual signature/validity check), then find-or-create the
 // user.
